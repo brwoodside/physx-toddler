@@ -1,0 +1,649 @@
+diff --git i/physx/snippets/snippetpbf/SnippetPBF.cpp w/physx/snippets/snippetpbf/SnippetPBF.cpp
+index 3c6cd15..8516388 100644
+--- i/physx/snippets/snippetpbf/SnippetPBF.cpp
++++ w/physx/snippets/snippetpbf/SnippetPBF.cpp
+@@ -32,6 +32,7 @@
+ // ****************************************************************************
+ 
+ #include <ctype.h>
++#include <vector>
+ #include "PxPhysicsAPI.h"
+ #include "../snippetcommon/SnippetPrint.h"
+ #include "../snippetcommon/SnippetPVD.h"
+@@ -48,32 +49,12 @@ static PxPhysics*						gPhysics			= NULL;
+ static PxDefaultCpuDispatcher*			gDispatcher			= NULL;
+ static PxScene*							gScene				= NULL;
+ static PxMaterial*						gMaterial			= NULL;
+-static PxPvd*							gPvd				= NULL;
+ static PxPBDParticleSystem*				gParticleSystem		= NULL;
+ static PxParticleAndDiffuseBuffer*		gParticleBuffer 	= NULL;
+ static bool								gIsRunning			= true;
+ static bool								gStep				= true;
+ 
+ 
+-PxRigidDynamic* movingWall;
+-
+-static void initObstacles()
+-{
+-	PxShape* shape = gPhysics->createShape(PxCapsuleGeometry(1.0f, 2.5f), *gMaterial);
+-	PxRigidDynamic* body = gPhysics->createRigidDynamic(PxTransform(PxVec3(3.5f, 3.5f, 0), PxQuat(PxPi*-0.5f, PxVec3(0, 0, 1))));
+-	body->attachShape(*shape);
+-	body->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, true);
+-	gScene->addActor(*body);
+-	shape->release();
+-
+-	shape = gPhysics->createShape(PxBoxGeometry(1.0f, 1.0f, 5.0f), *gMaterial);
+-	body = gPhysics->createRigidDynamic(PxTransform(PxVec3(3.5f, 0.75f, 0)));
+-	body->attachShape(*shape);
+-	body->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, true);
+-	gScene->addActor(*body);
+-	shape->release();
+-}
+-
+ static int								gMaxDiffuseParticles = 0;
+ 
+ // -----------------------------------------------------------------------------------------------------------------
+@@ -231,123 +212,133 @@ PxParticleAndDiffuseBuffer* getParticleBuffer()
+ 
+ 
+ 
++
++// ---------------------------------------------------------------- Magna-Tile ball run scene
++// World is metric: a 1.2 m wide x 1.4 m tall run inside a 0.24 m deep glass channel.
++static const PxReal kW = 1.2f, kH = 1.4f, kDepth = 0.12f;   // kDepth = half depth of the channel
++static const PxReal kTileHalfT = 0.006f, kBallR = 0.035f;
++struct Seg { PxReal x0, y0, x1, y1; };
++static const Seg kTiles[] = {
++	{0.05f, 1.15f, 0.75f, 1.02f},  // ramp 1 (slopes right)
++	{1.15f, 0.92f, 0.45f, 0.80f},  // ramp 2 (slopes left)
++	{0.05f, 0.70f, 0.75f, 0.58f},  // ramp 3
++	{1.15f, 0.48f, 0.45f, 0.36f},  // ramp 4
++	{0.30f, 0.00f, 0.30f, 0.18f}, {0.90f, 0.00f, 0.90f, 0.18f},  // basin walls
++	{0.55f, 0.20f, 0.65f, 0.20f},  // bump
++};
++static const PxVec3 kSpout(0.20f, 1.36f, 0.0f);
++static PxU32 gFrame = 0;
++static const PxU32 kMaxBalls = 30;
++static std::vector<PxRigidDynamic*> gBalls;
++static PxReal gBallRadius = kBallR;
++
++static void addTile(const Seg& s)
++{
++	const PxVec3 a(s.x0, s.y0, 0), b(s.x1, s.y1, 0);
++	const PxVec3 d = b - a;
++	const PxReal len = d.magnitude();
++	const PxReal ang = atan2f(d.y, d.x);
++	PxShape* shape = gPhysics->createShape(PxBoxGeometry(0.5f * len, kTileHalfT, kDepth), *gMaterial);
++	shape->setContactOffset(0.004f);
++	shape->setRestOffset(0.0f);
++	PxRigidStatic* body = gPhysics->createRigidStatic(PxTransform(0.5f * (a + b), PxQuat(ang, PxVec3(0, 0, 1))));
++	body->attachShape(*shape);
++	gScene->addActor(*body);
++	shape->release();
++}
++
++// ---- ball management API (also used by the render-side UI overlay)
++PxRigidDynamic* spawnBall(const PxVec3& pos, PxReal r)
++{
++	if (gBalls.size() >= kMaxBalls) return NULL;
++	PxShape* shape = gPhysics->createShape(PxSphereGeometry(r), *gMaterial);
++	shape->setContactOffset(0.004f);
++	shape->setRestOffset(0.0f);
++	PxRigidDynamic* body = gPhysics->createRigidDynamic(PxTransform(pos));
++	body->attachShape(*shape);
++	PxRigidBodyExt::updateMassAndInertia(*body, 300.0f);   // light plastic, ~54 g at r = 35 mm
++	body->setSolverIterationCounts(8, 2);
++	gScene->addActor(*body);
++	shape->release();
++	gBalls.push_back(body);
++	return body;
++}
++
++void dropBall()
++{
++	spawnBall(kSpout + PxVec3(0.10f * (gBalls.size() % 3), 0, 0), gBallRadius);
++}
++
++void clearBalls()
++{
++	for (size_t i = 0; i < gBalls.size(); ++i)
++	{
++		gScene->removeActor(*gBalls[i]);
++		gBalls[i]->release();
++	}
++	gBalls.clear();
++}
++
++PxU32  getNumBalls()               { return PxU32(gBalls.size()); }
++PxU32  getMaxBalls()               { return kMaxBalls; }
++PxReal getBallRadius()             { return gBallRadius; }
++void   setBallRadius(PxReal r)     { gBallRadius = PxClamp(r, 0.015f, 0.08f); }
++bool   isPaused()                  { return !gIsRunning; }
++void   setPaused(bool p)           { gIsRunning = !p; }
++void   getRunExtent(PxReal& w, PxReal& h, PxReal& halfDepth) { w = kW; h = kH; halfDepth = kDepth; }
++
+ // -----------------------------------------------------------------------------------------------------------------
+ void initPhysics(bool /*interactive*/)
+ {
+ 	gFoundation = PxCreateFoundation(PX_PHYSICS_VERSION, gAllocator, gErrorCallback);
+-
+-	gPvd = PxCreatePvd(*gFoundation);
+-	PxPvdTransport* transport = PxDefaultPvdSocketTransportCreate(PVD_HOST, 5425, 10);
+-	gPvd->connect(*transport, PxPvdInstrumentationFlag::eALL);
+-
+-	gPhysics = PxCreatePhysics(PX_PHYSICS_VERSION, *gFoundation, PxTolerancesScale(), true, gPvd);
++	gPhysics = PxCreatePhysics(PX_PHYSICS_VERSION, *gFoundation, PxTolerancesScale(), true, NULL);
+ 
+ 	initScene();
++	if (PxCudaContextManager* ccm = gScene->getCudaContextManager())
++		printf("PhysX GPU: %s\n", ccm->getDeviceName());
++	gMaterial = gPhysics->createMaterial(0.4f, 0.3f, 0.35f);
+ 
+-	PxPvdSceneClient* pvdClient = gScene->getScenePvdClient();
+-	if (pvdClient)
+-	{
+-		pvdClient->setScenePvdFlag(PxPvdSceneFlag::eTRANSMIT_CONSTRAINTS, true);
+-		pvdClient->setScenePvdFlag(PxPvdSceneFlag::eTRANSMIT_CONTACTS, true);
+-		pvdClient->setScenePvdFlag(PxPvdSceneFlag::eTRANSMIT_SCENEQUERIES, true);
+-	}
+-	gMaterial = gPhysics->createMaterial(0.5f, 0.5f, 0.6f);
++	// Water: a block above the first ramp, spacing 12 mm, ~6000 fluid particles.
++	initParticles(21, 17, 19, PxVec3(0.05f, 1.18f, -kDepth + 0.015f), 0.012f, 1000.0f, 20000);
++	gParticleSystem->setMaxVelocity(8.0f);
+ 
+-	// Setup PBF
+-	bool useLargeFluid = true;
+-	bool useMovingWall = true;
+-
+-	const PxReal fluidDensity = 1000.0f;
+-
+-	const PxU32 maxDiffuseParticles = useLargeFluid ? 2000000 : 100000;
+-	initParticles(50, 120 * (useLargeFluid ? 5 : 1), 30, PxVec3(-2.5f, 3.f, 0.5f), 0.1f, fluidDensity, maxDiffuseParticles);
+-
+-	initObstacles();
+-
+-	// Setup container
++	// Container: floor, side walls, and two "glass" walls that make the channel thin in z.
+ 	gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(0.f, 1.f, 0.f, 0.0f), *gMaterial));
+-	gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(-1.f, 0.f, 0.f, 7.5f), *gMaterial));
+-	gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(0.f, 0.f, 1.f, 7.5f), *gMaterial));
+-	gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(0.f, 0.f, -1.f, 7.5f), *gMaterial));
+-
+-	if (!useMovingWall)
+-	{
+-		gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(1.f, 0.f, 0.f, 7.5f), *gMaterial));
+-		movingWall = NULL;
+-	}
+-	else
+-	{
+-		PxTransform trans = PxTransformFromPlaneEquation(PxPlane(1.f, 0.f, 0.f, 5.f));
+-		movingWall = gPhysics->createRigidDynamic(trans);
+-		movingWall->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, true);
+-		PxRigidActorExt::createExclusiveShape(*movingWall, PxPlaneGeometry(), *gMaterial);
+-		gScene->addActor(*movingWall);
+-	}
+-
+-	// Setup rigid bodies
+-	const PxReal dynamicsDensity = fluidDensity * 0.5f;
+-	const PxReal boxSize = 1.0f;
+-	const PxReal boxMass = boxSize * boxSize * boxSize * dynamicsDensity;
+-	PxShape* shape = gPhysics->createShape(PxBoxGeometry(0.5f * boxSize, 0.5f * boxSize, 0.5f * boxSize), *gMaterial);
+-	for (int i = 0; i < 5; ++i)
+-	{
+-		PxRigidDynamic* body = gPhysics->createRigidDynamic(PxTransform(PxVec3(i - 3.0f, 10, 7.5f)));
+-		body->attachShape(*shape);
+-		PxRigidBodyExt::updateMassAndInertia(*body, boxMass);
+-		gScene->addActor(*body);
+-	}
+-	shape->release();
++	gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(1.f, 0.f, 0.f, 0.0f), *gMaterial));
++	gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(-1.f, 0.f, 0.f, kW), *gMaterial));
++	gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(0.f, 0.f, 1.f, kDepth), *gMaterial));
++	gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(0.f, 0.f, -1.f, kDepth), *gMaterial));
++	for (PxU32 i = 0; i < sizeof(kTiles) / sizeof(kTiles[0]); ++i)
++		addTile(kTiles[i]);
++	dropBall();
++	printf("Ball run: %u tiles, %u water particles. Keys: B = drop ball, M = place mode, X = clear balls, [ ] = ball radius, P = pause, O = step, C = reset view\n"
++		"Mouse: left drag = orbit, right drag = pan, wheel / middle drag = zoom\n",
++		PxU32(sizeof(kTiles) / sizeof(kTiles[0])), 21u * 17u * 19u);
+ }
+ 
+ // ---------------------------------------------------
+-
+ void stepPhysics(bool /*interactive*/)
+ {
+ 	if (gIsRunning || gStep)
+ 	{
+ 		gStep = false;
+ 		const PxReal dt = 1.0f / 60.0f;
+-
+-		if (movingWall)
+-		{
+-			static bool moveOut = false;
+-			const PxReal speed = 3.0f;
+-			PxTransform pose = movingWall->getGlobalPose();
+-			if (moveOut)
+-			{
+-				pose.p.x += dt * speed;
+-				if (pose.p.x > -7.f)
+-					moveOut = false;
+-			}
+-			else
+-			{
+-				pose.p.x -= dt * speed;
+-				if (pose.p.x < -15.f)
+-					moveOut = true;
+-			}
+-			movingWall->setKinematicTarget(pose);
+-		}
+-
++		++gFrame;
+ 		gScene->simulate(dt);
+ 		gScene->fetchResults(true);
+ 		gScene->fetchResultsParticleSystem();
+ 	}
+ }
+-	
++
+ void cleanupPhysics(bool /*interactive*/)
+ {
++	PxCudaContextManager* ccm = gScene ? gScene->getCudaContextManager() : NULL;
+ 	PX_RELEASE(gScene);
+ 	PX_RELEASE(gDispatcher);
+ 	PX_RELEASE(gPhysics);
+-	if(gPvd)
+-	{
+-		PxPvdTransport* transport = gPvd->getTransport();
+-		gPvd->release();	gPvd = NULL;
+-		PX_RELEASE(transport);
+-	}
++	if (ccm) ccm->release();
+ 	PX_RELEASE(gFoundation);
+-	
+-	printf("SnippetPBFFluid done.\n");
++	printf("SnippetPBF (ball run) done.\n");
+ }
+ 
+ void keyPress(unsigned char key, const PxTransform& /*camera*/)
+@@ -356,6 +347,14 @@ void keyPress(unsigned char key, const PxTransform& /*camera*/)
+ 	{
+ 	case 'P':	gIsRunning = !gIsRunning;	break;
+ 	case 'O':	gIsRunning = false; gStep = true;	break;
++	case 'B':	dropBall(); break;
++	case 'X':	clearBalls(); break;
++	case '[':	setBallRadius(gBallRadius - 0.005f); break;
++	case ']':	setBallRadius(gBallRadius + 0.005f); break;
++#ifdef RENDER_SNIPPET
++	case 'C':	{ extern void resetCamera(); resetCamera(); } break;
++	case 'M':	{ extern void togglePlaceMode(); togglePlaceMode(); } break;
++#endif
+ 	}
+ }
+ 
+@@ -371,6 +370,5 @@ int snippetMain(int, const char*const*)
+ 		stepPhysics(false);
+ 	cleanupPhysics(false);
+ #endif
+-
+ 	return 0;
+ }
+diff --git i/physx/snippets/snippetpbf/SnippetPBFRender.cpp w/physx/snippets/snippetpbf/SnippetPBFRender.cpp
+index abdc7b9..435fba4 100644
+--- i/physx/snippets/snippetpbf/SnippetPBFRender.cpp
++++ w/physx/snippets/snippetpbf/SnippetPBFRender.cpp
+@@ -36,6 +36,8 @@
+ 
+ #include "../snippetrender/SnippetRender.h"
+ #include "../snippetrender/SnippetCamera.h"
++#include "../snippetrender/SnippetFontRenderer.h"
++#include <stdio.h>
+ 
+ #define CUDA_SUCCESS 0
+ #define SHOW_SOLID_SDF_SLICE 0
+@@ -50,6 +52,16 @@ extern PxPBDParticleSystem* getParticleSystem();
+ extern PxParticleAndDiffuseBuffer* getParticleBuffer();
+ 
+ extern int getNumDiffuseParticles();
++extern PxRigidDynamic* spawnBall(const PxVec3& pos, PxReal r);
++extern void   dropBall();
++extern void   clearBalls();
++extern PxU32  getNumBalls();
++extern PxU32  getMaxBalls();
++extern PxReal getBallRadius();
++extern void   setBallRadius(PxReal r);
++extern bool   isPaused();
++extern void   setPaused(bool p);
++extern void   getRunExtent(PxReal& w, PxReal& h, PxReal& halfDepth);
+ 
+ 
+ namespace
+@@ -59,6 +71,275 @@ Snippets::Camera* sCamera;
+ Snippets::SharedGLBuffer sPosBuffer;
+ Snippets::SharedGLBuffer sDiffusePosLifeBuffer;
+ 
++// ---------------------------------------------------------------- orbit camera
++// Left drag: orbit around the run.  Right drag: pan.  Wheel / middle drag: zoom.  C: reset view.
++static const PxVec3 kHomeTarget(0.6f, 0.7f, 0.0f);
++static const float  kHomeDist = 2.4f;
++PxVec3 sTarget = kHomeTarget;
++float  sYaw = 0.0f, sPitch = 0.0f, sDist = kHomeDist;
++int    sLastX = 0, sLastY = 0, sButton = -1;
++
++void applyOrbit()
++{
++	const float cp = cosf(sPitch), sp = sinf(sPitch);
++	const PxVec3 dir(-sinf(sYaw) * cp, -sp, -cosf(sYaw) * cp);   // eye -> target
++	sCamera->setPose(sTarget - dir * sDist, dir);
++}
++
++PxVec3 orbitDir()
++{
++	const float cp = cosf(sPitch), sp = sinf(sPitch);
++	return PxVec3(-sinf(sYaw) * cp, -sp, -cosf(sYaw) * cp);
++}
++
++// ---------------------------------------------------------------- UI overlay + ball placement
++// Panel of clickable buttons (top-left).  "Place mode": a ghost ball follows the cursor on the
++// run's mid-plane (z = 0); a click (not a drag) drops a ball there.  Drags still orbit / pan / zoom.
++enum ButtonId { BTN_DROP, BTN_PLACE, BTN_RAD_MINUS, BTN_RAD_PLUS, BTN_CLEAR, BTN_PAUSE, BTN_VIEW, BTN_COUNT };
++struct Button { int x, y, w, h; ButtonId id; };   // pixels, origin top-left
++static const int kPanelX = 12, kPanelY = 12, kPanelW = 260, kBtnH = 30, kGap = 6;
++Button sButtons[BTN_COUNT];
++int    sHoverBtn = -1;
++bool   sPlaceMode = false;
++int    sCursorX = -1, sCursorY = -1;
++int    sPressX = 0, sPressY = 0;
++bool   sGhostValid = false;
++PxVec3 sGhostPos(0.0f);
++
++int layoutButtons()   // returns panel height in pixels
++{
++	int y = kPanelY + 8 + 3 * 18 + 6;   // below three status lines
++	const int x = kPanelX + 8, w = kPanelW - 16, hw = (w - kGap) / 2;
++	int n = 0;
++	sButtons[n++] = Button{ x, y, w, kBtnH, BTN_DROP };           y += kBtnH + kGap;
++	sButtons[n++] = Button{ x, y, w, kBtnH, BTN_PLACE };          y += kBtnH + kGap;
++	sButtons[n++] = Button{ x, y, hw, kBtnH, BTN_RAD_MINUS };
++	sButtons[n++] = Button{ x + hw + kGap, y, hw, kBtnH, BTN_RAD_PLUS };  y += kBtnH + kGap;
++	sButtons[n++] = Button{ x, y, w, kBtnH, BTN_CLEAR };          y += kBtnH + kGap;
++	sButtons[n++] = Button{ x, y, hw, kBtnH, BTN_PAUSE };
++	sButtons[n++] = Button{ x + hw + kGap, y, hw, kBtnH, BTN_VIEW };      y += kBtnH + kGap;
++	return y + 8 - kPanelY;
++}
++
++int hitButton(int x, int y)
++{
++	for (int i = 0; i < BTN_COUNT; ++i)
++	{
++		const Button& b = sButtons[i];
++		if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) return i;
++	}
++	return -1;
++}
++
++bool inPanel(int x, int y)
++{
++	const int ph = layoutButtons();
++	return x >= kPanelX && x < kPanelX + kPanelW && y >= kPanelY && y < kPanelY + ph;
++}
++
++void pressButton(ButtonId id)
++{
++	switch (id)
++	{
++	case BTN_DROP:      dropBall(); break;
++	case BTN_PLACE:     sPlaceMode = !sPlaceMode; break;
++	case BTN_RAD_MINUS: setBallRadius(getBallRadius() - 0.005f); break;
++	case BTN_RAD_PLUS:  setBallRadius(getBallRadius() + 0.005f); break;
++	case BTN_CLEAR:     clearBalls(); break;
++	case BTN_PAUSE:     setPaused(!isPaused()); break;
++	case BTN_VIEW:      sTarget = kHomeTarget; sYaw = 0.0f; sPitch = 0.0f; sDist = kHomeDist; break;
++	default: break;
++	}
++}
++
++// Cursor -> world ray, using the same basis gluLookAt builds in startRender (up = +y).
++PxVec3 cursorRay(int x, int y)
++{
++	const float w = float(Snippets::getScreenWidth()), h = float(Snippets::getScreenHeight());
++	const float u = (float(x) / w) * 2.0f - 1.0f;
++	const float v = 1.0f - (float(y) / h) * 2.0f;
++	const float t = tanf(PxDegToRad(30.0f));   // half of the 60 degree vertical FOV
++	const PxVec3 f = orbitDir();
++	const PxVec3 sdir = f.cross(PxVec3(0, 1, 0)).getNormalized();
++	const PxVec3 up = sdir.cross(f);
++	return (f + sdir * (u * t * w / h) + up * (v * t)).getNormalized();
++}
++
++void updateGhost()
++{
++	sGhostValid = false;
++	if (!sPlaceMode || sCursorX < 0 || inPanel(sCursorX, sCursorY)) return;
++	const PxVec3 eye = sTarget - orbitDir() * sDist;
++	const PxVec3 ray = cursorRay(sCursorX, sCursorY);
++	if (fabsf(ray.z) < 1e-4f) return;
++	const float t = -eye.z / ray.z;          // hit the z = 0 mid-plane
++	if (t <= 0.0f) return;
++	PxReal w, h, d; getRunExtent(w, h, d);
++	const PxReal r = getBallRadius();
++	PxVec3 p = eye + ray * t;
++	p.x = PxClamp(p.x, r + 0.005f, w - r - 0.005f);
++	p.y = PxClamp(p.y, r + 0.005f, h + 0.3f);
++	p.z = 0.0f;
++	sGhostPos = p;
++	sGhostValid = true;
++}
++
++void orbitMouse(int button, int state, int x, int y)
++{
++	sCursorX = x; sCursorY = y;
++	if (button == 3 || button == 4)   // freeglut wheel up / down
++	{
++		if (state == GLUT_DOWN && !inPanel(x, y))
++			sDist = PxClamp(sDist * (button == 3 ? 0.9f : 1.1f), 0.2f, 20.0f);
++		return;
++	}
++	if (state == GLUT_DOWN)
++	{
++		sPressX = x; sPressY = y;
++		if (button == GLUT_LEFT_BUTTON && inPanel(x, y))
++		{
++			const int b = hitButton(x, y);
++			if (b >= 0) pressButton(sButtons[b].id);
++			sButton = -1;
++			return;
++		}
++		sButton = button;
++	}
++	else
++	{
++		const bool click = abs(x - sPressX) < 4 && abs(y - sPressY) < 4;
++		if (button == GLUT_LEFT_BUTTON && click && sPlaceMode && !inPanel(x, y))
++		{
++			updateGhost();
++			if (sGhostValid) spawnBall(sGhostPos, getBallRadius());
++		}
++		sButton = -1;
++	}
++	sLastX = x; sLastY = y;
++}
++
++void orbitPassiveMotion(int x, int y)
++{
++	sCursorX = x; sCursorY = y;
++	sHoverBtn = hitButton(x, y);
++}
++
++void orbitMotion(int x, int y)
++{
++	sCursorX = x; sCursorY = y;
++	const int dx = x - sLastX, dy = y - sLastY;
++	sLastX = x; sLastY = y;
++	if (sButton == GLUT_LEFT_BUTTON)
++	{
++		sYaw   -= float(dx) * 0.005f;
++		sPitch  = PxClamp(sPitch + float(dy) * 0.005f, -1.55f, 1.55f);
++	}
++	else if (sButton == GLUT_RIGHT_BUTTON)
++	{
++		const PxVec3 dir = orbitDir();
++		const PxVec3 right = dir.cross(PxVec3(0, 1, 0)).getNormalized();
++		const PxVec3 up = right.cross(dir);
++		const float k = sDist * 0.0015f;
++		sTarget += right * (-float(dx) * k) + up * (float(dy) * k);
++	}
++	else if (sButton == GLUT_MIDDLE_BUTTON)
++	{
++		sDist = PxClamp(sDist * expf(float(dy) * 0.01f), 0.2f, 20.0f);
++	}
++}
++
++void drawGhostBall()
++{
++	updateGhost();
++	if (!sGhostValid) return;
++	glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT | GL_LINE_BIT);
++	glDisable(GL_LIGHTING);
++	glDisable(GL_CULL_FACE);
++	glEnable(GL_BLEND);
++	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++	glPushMatrix();
++	glTranslatef(sGhostPos.x, sGhostPos.y, sGhostPos.z);
++	glColor4f(0.3f, 1.0f, 0.4f, 0.35f);
++	glutSolidSphere(getBallRadius(), 20, 14);
++	glColor4f(0.3f, 1.0f, 0.4f, 0.9f);
++	glLineWidth(1.5f);
++	glutWireSphere(getBallRadius() * 1.01f, 12, 8);
++	glPopMatrix();
++	glPopAttrib();
++}
++
++void rect(int x, int y, int w, int h, float r, float g, float b, float a)   // pixel coords, origin top-left
++{
++	const float H = float(Snippets::getScreenHeight());
++	glColor4f(r, g, b, a);
++	glBegin(GL_QUADS);
++	glVertex2f(float(x), H - float(y));
++	glVertex2f(float(x + w), H - float(y));
++	glVertex2f(float(x + w), H - float(y + h));
++	glVertex2f(float(x), H - float(y + h));
++	glEnd();
++}
++
++void text(int x, int yTop, int px, const char* str, float r = 1.0f, float g = 1.0f, float b = 1.0f)
++{
++	const float W = float(Snippets::getScreenWidth()), H = float(Snippets::getScreenHeight());
++	GLFontRenderer::setColor(r, g, b, 1.0f);
++	GLFontRenderer::print(float(x) / W, (H - float(yTop + px)) / H, float(px) / H, str);
++}
++
++void drawOverlay()
++{
++	const int W = int(Snippets::getScreenWidth()), H = int(Snippets::getScreenHeight());
++	const int panelH = layoutButtons();
++
++	glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT);
++	glDisable(GL_DEPTH_TEST);
++	glDisable(GL_LIGHTING);
++	glDisable(GL_TEXTURE_2D);
++	glDisable(GL_CULL_FACE);
++	glEnable(GL_BLEND);
++	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++	glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
++	glOrtho(0, W, 0, H, -1, 1);
++	glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
++
++	rect(kPanelX, kPanelY, kPanelW, panelH, 0.05f, 0.05f, 0.08f, 0.72f);
++
++	char label[64];
++	for (int i = 0; i < BTN_COUNT; ++i)
++	{
++		const Button& b = sButtons[i];
++		const bool hot = (i == sHoverBtn);
++		const bool on = (b.id == BTN_PLACE && sPlaceMode) || (b.id == BTN_PAUSE && isPaused());
++		if (on)       rect(b.x, b.y, b.w, b.h, 0.15f, 0.55f, 0.30f, hot ? 1.0f : 0.9f);
++		else if (hot) rect(b.x, b.y, b.w, b.h, 0.35f, 0.45f, 0.70f, 1.0f);
++		else          rect(b.x, b.y, b.w, b.h, 0.22f, 0.26f, 0.40f, 0.95f);
++		switch (b.id)
++		{
++		case BTN_DROP:      strcpy(label, "Drop ball at spout  (B)"); break;
++		case BTN_PLACE:     strcpy(label, sPlaceMode ? "Place mode: ON  (M)" : "Place mode: OFF  (M)"); break;
++		case BTN_RAD_MINUS: strcpy(label, "Smaller  ["); break;
++		case BTN_RAD_PLUS:  strcpy(label, "Bigger  ]"); break;
++		case BTN_CLEAR:     strcpy(label, "Clear balls  (X)"); break;
++		case BTN_PAUSE:     strcpy(label, isPaused() ? "Resume  (P)" : "Pause  (P)"); break;
++		case BTN_VIEW:      strcpy(label, "Reset view  (C)"); break;
++		default: label[0] = 0;
++		}
++		text(b.x + 8, b.y + 7, 15, label);
++	}
++
++	text(kPanelX + 8, kPanelY + 6, 15, "BALL RUN", 0.85f, 0.9f, 1.0f);
++	snprintf(label, sizeof(label), "Balls %u / %u    radius %.0f mm", getNumBalls(), getMaxBalls(), getBallRadius() * 1000.0f);
++	text(kPanelX + 8, kPanelY + 6 + 18, 14, label, 0.8f, 0.8f, 0.85f);
++	text(kPanelX + 8, kPanelY + 6 + 36, 13, sPlaceMode ? "Click in the run to place a ball" : "Drag: orbit   R-drag: pan   Wheel: zoom", 0.7f, 0.9f, 0.7f);
++
++	glMatrixMode(GL_PROJECTION); glPopMatrix();
++	glMatrixMode(GL_MODELVIEW); glPopMatrix();
++	glPopAttrib();
++	glEnable(GL_DEPTH_TEST);
++	glEnable(GL_LIGHTING);
++}
++
+ void onBeforeRenderParticles()
+ {	
+ }
+@@ -96,7 +377,7 @@ void renderParticles()
+ 	sPosBuffer.unmap();
+ 	sDiffusePosLifeBuffer.unmap();
+ 	PxVec3 color(0.5f, 0.5f, 1);
+-	Snippets::DrawPoints(sPosBuffer.vbo, sPosBuffer.size / sizeof(PxVec4), color, 2.f);
++	Snippets::DrawPoints(sPosBuffer.vbo, sPosBuffer.size / sizeof(PxVec4), color, 4.f);
+ 
+ 	PxParticleAndDiffuseBuffer* userBuffer = getParticleBuffer();
+ 
+@@ -139,6 +420,7 @@ void clearupParticleBuffers()
+ 
+ void renderCallback()
+ {
++	applyOrbit();
+ 	onBeforeRenderParticles();
+ 
+ 	stepPhysics(true);
+@@ -156,6 +438,8 @@ void renderCallback()
+ 	}
+ 	
+ 	renderParticles();
++	drawGhostBall();
++	drawOverlay();
+ 
+ 	Snippets::showFPS();
+ 
+@@ -174,11 +458,25 @@ void exitCallback(void)
+ }
+ }
+ 
++void togglePlaceMode()
++{
++	sPlaceMode = !sPlaceMode;
++}
++
++void resetCamera()
++{
++	sTarget = kHomeTarget; sYaw = 0.0f; sPitch = 0.0f; sDist = kHomeDist;
++}
++
+ void renderLoop()
+ {
+-	sCamera = new Snippets::Camera(PxVec3(15.0f, 10.0f, 15.0f), PxVec3(-0.6f,-0.2f,-0.6f));
++	sCamera = new Snippets::Camera(PxVec3(0.6f, 0.72f, 2.4f), PxVec3(0.0f, 0.0f, -1.0f));
+ 
+-	Snippets::setupDefault("PhysX Snippet PBFFluid", sCamera, keyPress, renderCallback, exitCallback);
++	Snippets::setupDefault("Ball run (PhysX 5.3 PBD fluid)", sCamera, keyPress, renderCallback, exitCallback);
++	glutMouseFunc(orbitMouse);
++	glutMotionFunc(orbitMotion);
++	glutPassiveMotionFunc(orbitPassiveMotion);
++	applyOrbit();
+ 
+ 	initPhysics(true);
+ 	Snippets::initFPS();
