@@ -1,16 +1,21 @@
 diff --git i/physx/snippets/snippetpbf/SnippetPBF.cpp w/physx/snippets/snippetpbf/SnippetPBF.cpp
-index 3c6cd15..8516388 100644
+index 3c6cd15..d126d13 100644
 --- i/physx/snippets/snippetpbf/SnippetPBF.cpp
 +++ w/physx/snippets/snippetpbf/SnippetPBF.cpp
-@@ -32,6 +32,7 @@
+@@ -32,7 +32,12 @@
  // ****************************************************************************
  
  #include <ctype.h>
++#include <stdlib.h>
++#include <stdint.h>
 +#include <vector>
  #include "PxPhysicsAPI.h"
++#include "cudamanager/PxCudaContext.h"
++#include "cudamanager/PxCudaContextManager.h"
  #include "../snippetcommon/SnippetPrint.h"
  #include "../snippetcommon/SnippetPVD.h"
-@@ -48,32 +49,12 @@ static PxPhysics*						gPhysics			= NULL;
+ #include "../snippetutils/SnippetUtils.h"
+@@ -48,32 +53,12 @@ static PxPhysics*						gPhysics			= NULL;
  static PxDefaultCpuDispatcher*			gDispatcher			= NULL;
  static PxScene*							gScene				= NULL;
  static PxMaterial*						gMaterial			= NULL;
@@ -43,43 +48,267 @@ index 3c6cd15..8516388 100644
  static int								gMaxDiffuseParticles = 0;
  
  // -----------------------------------------------------------------------------------------------------------------
-@@ -231,123 +212,133 @@ PxParticleAndDiffuseBuffer* getParticleBuffer()
+@@ -116,13 +101,19 @@ int getNumDiffuseParticles()
+ }
+ 
+ // -----------------------------------------------------------------------------------------------------------------
+-static void initParticles(const PxU32 numX, const PxU32 numY, const PxU32 numZ, const PxVec3& position = PxVec3(0, 0, 0), const PxReal particleSpacing = 0.2f, const PxReal fluidDensity = 1000.f, const PxU32 maxDiffuseParticles = 100000)
++static PxU32 gParticleCapacity = 0;
++static PxReal gParticleInvMass = 1.0f;
++static PxU32 gParticlePhase = 0;
++
++// Creates the fluid system with room for `capacity` particles, none active.  The hose fills it at runtime.
++static void initParticles(const PxU32 capacity, const PxReal particleSpacing, const PxReal fluidDensity, const PxU32 maxDiffuseParticles)
+ {
+ 	PxCudaContextManager* cudaContextManager = gScene->getCudaContextManager();
+ 	if (cudaContextManager == NULL)
+ 		return;
+ 
+-	const PxU32 maxParticles = numX * numY * numZ;
++	const PxU32 maxParticles = capacity;
++	gParticleCapacity = capacity;
+ 
+ 	const PxReal restOffset = 0.5f * particleSpacing / 0.6f;
+ 	
+@@ -169,40 +160,21 @@ static void initParticles(const PxU32 numX, const PxU32 numY, const PxU32 numZ,
+ 	// Create particles and add them to the particle system
+ 	const PxU32 particlePhase = particleSystem->createPhase(defaultMat, PxParticlePhaseFlags(PxParticlePhaseFlag::eParticlePhaseFluid | PxParticlePhaseFlag::eParticlePhaseSelfCollide));
+ 
++	gParticlePhase = particlePhase;
++	gParticleInvMass = 1.0f / particleMass;
+ 	PxU32* phase = cudaContextManager->allocPinnedHostBuffer<PxU32>(maxParticles);
+ 	PxVec4* positionInvMass = cudaContextManager->allocPinnedHostBuffer<PxVec4>(maxParticles);
+ 	PxVec4* velocity = cudaContextManager->allocPinnedHostBuffer<PxVec4>(maxParticles);
+-
+-	PxReal x = position.x;
+-	PxReal y = position.y;
+-	PxReal z = position.z;
+-
+-	for (PxU32 i = 0; i < numX; ++i)
++	for (PxU32 i = 0; i < maxParticles; ++i)
+ 	{
+-		for (PxU32 j = 0; j < numY; ++j)
+-		{
+-			for (PxU32 k = 0; k < numZ; ++k)
+-			{
+-				const PxU32 index = i * (numY * numZ) + j * numZ + k;
+-
+-				PxVec4 pos(x, y, z, 1.0f / particleMass);
+-				phase[index] = particlePhase;
+-				positionInvMass[index] = pos;
+-				velocity[index] = PxVec4(0.0f);
+-
+-				z += particleSpacing;
+-			}
+-			z = position.z;
+-			y += particleSpacing;
+-		}
+-		y = position.y;
+-		x += particleSpacing;
++		phase[i] = particlePhase;
++		positionInvMass[i] = PxVec4(0.6f, -5.0f, 0.0f, gParticleInvMass);   // parked; inactive until the hose emits it
++		velocity[i] = PxVec4(0.0f);
+ 	}
+ 
+-
+ 	ExtGpu::PxParticleAndDiffuseBufferDesc bufferDesc;
+ 	bufferDesc.maxParticles = maxParticles;
+-	bufferDesc.numActiveParticles = maxParticles;
++	bufferDesc.numActiveParticles = 0;
+ 	bufferDesc.maxDiffuseParticles = maxDiffuseParticles;
+ 	bufferDesc.maxActiveDiffuseParticles = maxDiffuseParticles;
+ 	bufferDesc.diffuseParams = dpParams;
+@@ -231,123 +203,382 @@ PxParticleAndDiffuseBuffer* getParticleBuffer()
  
  
  
 +
-+// ---------------------------------------------------------------- Magna-Tile ball run scene
-+// World is metric: a 1.2 m wide x 1.4 m tall run inside a 0.24 m deep glass channel.
-+static const PxReal kW = 1.2f, kH = 1.4f, kDepth = 0.12f;   // kDepth = half depth of the channel
-+static const PxReal kTileHalfT = 0.006f, kBallR = 0.035f;
-+struct Seg { PxReal x0, y0, x1, y1; };
-+static const Seg kTiles[] = {
-+	{0.05f, 1.15f, 0.75f, 1.02f},  // ramp 1 (slopes right)
-+	{1.15f, 0.92f, 0.45f, 0.80f},  // ramp 2 (slopes left)
-+	{0.05f, 0.70f, 0.75f, 0.58f},  // ramp 3
-+	{1.15f, 0.48f, 0.45f, 0.36f},  // ramp 4
-+	{0.30f, 0.00f, 0.30f, 0.18f}, {0.90f, 0.00f, 0.90f, 0.18f},  // basin walls
-+	{0.55f, 0.20f, 0.65f, 0.20f},  // bump
-+};
-+static const PxVec3 kSpout(0.20f, 1.36f, 0.0f);
++// ---------------------------------------------------------------- Magna-Tiles ball run scene
++// Modelled on the Lakeshore set photo: a tower of square tiles, half-pipe chutes zig-zagging down
++// through ring tiles with wall tiles at the drops, a funnel on top and a catch bowl at the bottom.
++// Built at 2x real size (tile = 150 mm, real 76 mm) so the 12 mm water particles resolve a chute.
++static const PxReal T = 0.15f;                         // one tile
++static const PxReal kTileT = 0.04f * T;                // tile thickness
++static const PxReal kChuteR = 0.36f * T, kChuteWall = 0.03f * T;
++static const PxReal kTrackZ = 0.5f * T;                // chute centre line, in front of the backdrop
++static const PxReal kW = 4.3f * T, kH = 5.6f * T;      // extents used by the placement ghost
++static const PxReal kBallR = 0.025f;                   // 50 mm ball at 2x scale
++static const PxVec3 kSpout(0.5f * T, 5.9f * T, kTrackZ);
 +static PxU32 gFrame = 0;
 +static const PxU32 kMaxBalls = 30;
 +static std::vector<PxRigidDynamic*> gBalls;
 +static PxReal gBallRadius = kBallR;
 +
-+static void addTile(const Seg& s)
++// Actor userData tags the piece kind and colour for the renderer: (kind << 8) | colourIndex.
++enum PieceKind { PIECE_TILE = 1, PIECE_CHUTE = 2 };
++static PxU32 gNumPieces = 0;
++
++static PxRigidStatic* gLastPiece = NULL;
++static PxRigidStatic* newPiece(PieceKind kind, PxU32 colour, const PxTransform& pose = PxTransform(PxIdentity))
 +{
-+	const PxVec3 a(s.x0, s.y0, 0), b(s.x1, s.y1, 0);
-+	const PxVec3 d = b - a;
-+	const PxReal len = d.magnitude();
-+	const PxReal ang = atan2f(d.y, d.x);
-+	PxShape* shape = gPhysics->createShape(PxBoxGeometry(0.5f * len, kTileHalfT, kDepth), *gMaterial);
-+	shape->setContactOffset(0.004f);
++	PxRigidStatic* body = gPhysics->createRigidStatic(pose);
++	gLastPiece = body;
++	body->userData = reinterpret_cast<void*>(uintptr_t((PxU32(kind) << 8) | (colour & 0xff)));
++	++gNumPieces;
++	return body;
++}
++
++// Box panel with its local x / y axes given explicitly (z = x cross y), attached to `body`.
++static void addPanel(PxRigidStatic* body, const PxVec3& centre, PxVec3 ax, PxVec3 ay, const PxVec3& half)
++{
++	ax.normalize();
++	ay = (ay - ax * ax.dot(ay)).getNormalized();
++	const PxVec3 az = ax.cross(ay);
++	const PxQuat q(PxMat33(ax, ay, az));
++	PxShape* shape = gPhysics->createShape(PxBoxGeometry(half), *gMaterial);
++	shape->setContactOffset(0.003f);
 +	shape->setRestOffset(0.0f);
-+	PxRigidStatic* body = gPhysics->createRigidStatic(PxTransform(0.5f * (a + b), PxQuat(ang, PxVec3(0, 0, 1))));
++	shape->setLocalPose(PxTransform(centre, q));
 +	body->attachShape(*shape);
-+	gScene->addActor(*body);
 +	shape->release();
++}
++
++// Tile orientation: local x = up cross n, local y = up, local z = n (the tile's normal).
++static PxQuat tileQuat(const PxVec3& n, const PxVec3& up)
++{
++	const PxVec3 ay = up.getNormalized(), ax = ay.cross(n.getNormalized()).getNormalized(), az = ax.cross(ay);
++	return PxQuat(PxMat33(ax, ay, az));
++}
++
++// Square tile: centre, normal direction n, "up" direction in the tile plane.  The actor's pose is
++// the tile centre so the editor can move it with setGlobalPose.
++static void addSquareTile(const PxVec3& c, const PxVec3& n, const PxVec3& up, PxU32 colour)
++{
++	PxRigidStatic* body = newPiece(PIECE_TILE, colour, PxTransform(c, tileQuat(n, up)));
++	addPanel(body, PxVec3(0), PxVec3(1, 0, 0), PxVec3(0, 1, 0), PxVec3(0.5f * T, 0.5f * T, 0.5f * kTileT));
++	gScene->addActor(*body);
++}
++
++// Ring tile: square frame with an octagonal hole of radius `hole`, same orientation convention.
++static void addRingTile(const PxVec3& c, const PxVec3& n, const PxVec3& up, PxReal hole, PxU32 colour)
++{
++	PxRigidStatic* body = newPiece(PIECE_TILE, colour, PxTransform(c, tileQuat(n, up)));
++	const PxVec3 ax(1, 0, 0), ay(0, 1, 0);
++	const PxReal band = 0.5f * (T - 2.0f * hole);                  // width of the four outer bands
++	const PxVec3 hb(0.5f * T, 0.5f * band, 0.5f * kTileT);
++	addPanel(body, ay * (0.5f * T - 0.5f * band), ax, ay, hb);       // top
++	addPanel(body, -ay * (0.5f * T - 0.5f * band), ax, ay, hb);      // bottom
++	addPanel(body, ax * (0.5f * T - 0.5f * band), ay, ax, hb);       // right
++	addPanel(body, -ax * (0.5f * T - 0.5f * band), ay, ax, hb);      // left
++	// four diagonal corner fillets turn the square hole into an octagon
++	const PxReal d = hole * 0.9239f;                                 // apothem of the octagon
++	const PxReal side = 2.0f * hole * 0.3827f;
++	for (int i = 0; i < 4; ++i)
++	{
++		const PxReal sx = (i & 1) ? -1.0f : 1.0f, sy = (i & 2) ? -1.0f : 1.0f;
++		const PxVec3 dir = (ax * sx + ay * sy).getNormalized();
++		const PxVec3 tan = (ax * sx - ay * sy).getNormalized();
++		addPanel(body, dir * (d + 0.06f * T), tan, dir, PxVec3(0.5f * side + 0.02f * T, 0.06f * T, 0.5f * kTileT));
++	}
++	gScene->addActor(*body);
++}
++
++// ---- tile editor API (used by the render-side build mode)
++static const PxReal kRingHole = 0.42f * T;
++PxRigidActor* createTile(const PxVec3& c, const PxVec3& n, const PxVec3& up, PxU32 colour, bool ring)
++{
++	if (ring) addRingTile(c, n, up, kRingHole, colour); else addSquareTile(c, n, up, colour);
++	if (getenv("BALLRUN_TRACE")) printf("createTile %s colour %u at (%.3f %.3f %.3f)\n", ring ? "ring" : "square", colour, c.x, c.y, c.z);
++	return gLastPiece;
++}
++bool isTile(PxRigidActor* a)               { return a && (PxU32(uintptr_t(a->userData)) >> 8) == PIECE_TILE; }
++PxU32 getPieceColour(PxRigidActor* a)      { return PxU32(uintptr_t(a->userData)) & 0xff; }
++void  getTileFrame(PxRigidActor* a, PxVec3& c, PxVec3& n, PxVec3& up)
++{
++	const PxTransform p = a->getGlobalPose();
++	c = p.p; n = p.q.rotate(PxVec3(0, 0, 1)); up = p.q.rotate(PxVec3(0, 1, 0));
++}
++void  moveTile(PxRigidActor* a, const PxVec3& c)   { a->setGlobalPose(PxTransform(c, a->getGlobalPose().q)); if (getenv("BALLRUN_TRACE")) printf("moveTile -> (%.3f %.3f %.3f)\n", c.x, c.y, c.z); }
++void  removeTile(PxRigidActor* a)                  { gScene->removeActor(*a); a->release(); --gNumPieces; if (getenv("BALLRUN_TRACE")) printf("removeTile\n"); }
++PxReal getTileSize()                               { return T; }
++PxReal getTileThickness()                          { return kTileT; }
++// Closest tile under a world ray (chutes and balls block the ray but are not returned).
++PxRigidActor* pickTile(const PxVec3& origin, const PxVec3& dir, PxVec3& hitPos)
++{
++	PxRaycastBuffer hit;
++	if (gScene->raycast(origin, dir.getNormalized(), 50.0f, hit) && hit.hasBlock && isTile(hit.block.actor))
++	{
++		hitPos = hit.block.position;
++		return hit.block.actor;
++	}
++	return NULL;
++}
++
++// Straight half-pipe chute from a to b (its axis), open at the top, 7 wall segments over 200 degrees.
++static void addChute(const PxVec3& a, const PxVec3& b, PxU32 colour)
++{
++	PxRigidStatic* body = newPiece(PIECE_CHUTE, colour);
++	const PxVec3 axis = (b - a).getNormalized();
++	const PxReal len = (b - a).magnitude();
++	const PxVec3 mid = 0.5f * (a + b);
++	const PxVec3 side = axis.cross(PxVec3(0, 1, 0)).getNormalized();   // horizontal, across the pipe
++	const PxVec3 down = side.cross(axis).getNormalized() * -1.0f;      // perpendicular "down"
++	const int nseg = 7; const PxReal span = 200.0f * PxPi / 180.0f;
++	const PxReal rc = kChuteR + 0.5f * kChuteWall;
++	for (int k = 0; k < nseg; ++k)
++	{
++		const PxReal phi = -0.5f * span + (k + 0.5f) * span / nseg;
++		const PxVec3 radial = down * cosf(phi) + side * sinf(phi);
++		const PxVec3 tangent = axis.cross(radial);
++		addPanel(body, mid + radial * rc, axis, tangent, PxVec3(0.5f * len, rc * sinf(0.5f * span / nseg) + 0.002f, 0.5f * kChuteWall));
++	}
++	gScene->addActor(*body);
++}
++
++// Cone / cylinder shell around a vertical axis: radius r0 at the bottom (y = base) to r1 at height h.
++static void addCone(const PxVec3& base, PxReal r0, PxReal r1, PxReal h, PxU32 colour)
++{
++	PxRigidStatic* body = newPiece(PIECE_CHUTE, colour);
++	const int nseg = 16;
++	const PxReal wallLen = sqrtf(h * h + (r1 - r0) * (r1 - r0));
++	for (int k = 0; k < nseg; ++k)
++	{
++		const PxReal psi = (k + 0.5f) * 2.0f * PxPi / nseg;
++		const PxVec3 radial(cosf(psi), 0, sinf(psi)), tangent(-sinf(psi), 0, cosf(psi));
++		const PxVec3 wall = (radial * (r1 - r0) + PxVec3(0, h, 0)).getNormalized();
++		const PxVec3 centre = base + radial * (0.5f * (r0 + r1)) + PxVec3(0, 0.5f * h, 0);
++		addPanel(body, centre, tangent, wall, PxVec3(0.5f * (r0 + r1) * sinf(PxPi / nseg) + 0.002f, 0.5f * wallLen, 0.5f * kChuteWall));
++	}
++	gScene->addActor(*body);
++}
++
++static void buildRun()
++{
++	const PxVec3 nz(0, 0, 1), up(0, 1, 0), nx(1, 0, 0);
++	// Tower backdrop: 4 columns x 5 rows of square tiles standing in the x-y plane behind the track.
++	for (int col = 0; col < 4; ++col)
++		for (int row = 0; row < 5; ++row)
++			addSquareTile(PxVec3((col + 0.5f) * T, (row + 0.5f) * T, -0.5f * kTileT), nz, up, PxU32((col * 2 + row) % 6));
++
++	// Chute levels, top to bottom, alternating direction.  Each drops 0.3 T over its length.
++	const PxVec3 L0a(0.00f * T, 4.20f * T, kTrackZ), L0b(3.70f * T, 3.90f * T, kTrackZ);
++	const PxVec3 L1a(4.00f * T, 3.10f * T, kTrackZ), L1b(0.30f * T, 2.80f * T, kTrackZ);
++	const PxVec3 L2a(0.00f * T, 2.00f * T, kTrackZ), L2b(3.70f * T, 1.70f * T, kTrackZ);
++	const PxVec3 L3a(4.00f * T, 0.90f * T, kTrackZ), L3b(0.30f * T, 0.60f * T, kTrackZ);
++	addChute(L0a, L0b, 0); addChute(L1a, L1b, 1); addChute(L2a, L2b, 2); addChute(L3a, L3b, 3);
++
++	// Ring tiles the chutes pass through (standing across the track), one per level.
++	const PxReal hole = 0.42f * T;
++	auto yAt = [](const PxVec3& a, const PxVec3& b, PxReal x) { return a.y + (b.y - a.y) * (x - a.x) / (b.x - a.x); };
++	addRingTile(PxVec3(3.4f * T, yAt(L0a, L0b, 3.4f * T) + 0.05f * T, kTrackZ), nx, up, hole, 1);
++	addRingTile(PxVec3(0.6f * T, yAt(L1a, L1b, 0.6f * T) + 0.05f * T, kTrackZ), nx, up, hole, 3);
++	addRingTile(PxVec3(3.4f * T, yAt(L2a, L2b, 3.4f * T) + 0.05f * T, kTrackZ), nx, up, hole, 5);
++	addRingTile(PxVec3(0.6f * T, yAt(L3a, L3b, 0.6f * T) + 0.05f * T, kTrackZ), nx, up, hole, 0);
++
++	// Wall tiles at the drops so a ball flying off a chute end turns down onto the next level.
++	addSquareTile(PxVec3(4.05f * T, 3.60f * T, kTrackZ), nx, up, 4);   // right of L0 -> L1
++	addSquareTile(PxVec3(-0.05f * T, 2.40f * T, kTrackZ), nx, up, 2);  // left of L1 -> L2
++	addSquareTile(PxVec3(4.05f * T, 1.40f * T, kTrackZ), nx, up, 0);   // right of L2 -> L3
++
++	// Funnel on top of the tower, its hole above the start of the top chute; hose sprays into it.
++	addCone(PxVec3(0.5f * T, 4.75f * T, kTrackZ), 0.22f * T, 0.65f * T, 0.55f * T, 4);
++	// Catch bowl on the floor at the left, where the last chute drops.
++	addCone(PxVec3(-0.15f * T, 0.0f, 0.65f * T), 0.85f * T, 0.85f * T, 0.35f * T, 5);
 +}
 +
 +// ---- ball management API (also used by the render-side UI overlay)
@@ -101,7 +330,7 @@ index 3c6cd15..8516388 100644
 +
 +void dropBall()
 +{
-+	spawnBall(kSpout + PxVec3(0.10f * (gBalls.size() % 3), 0, 0), gBallRadius);
++	spawnBall(kSpout + PxVec3(0.04f * (gBalls.size() % 3) - 0.04f, 0, 0), gBallRadius);
 +}
 +
 +void clearBalls()
@@ -117,10 +346,102 @@ index 3c6cd15..8516388 100644
 +PxU32  getNumBalls()               { return PxU32(gBalls.size()); }
 +PxU32  getMaxBalls()               { return kMaxBalls; }
 +PxReal getBallRadius()             { return gBallRadius; }
-+void   setBallRadius(PxReal r)     { gBallRadius = PxClamp(r, 0.015f, 0.08f); }
++void   setBallRadius(PxReal r)     { gBallRadius = PxClamp(r, 0.012f, 0.032f); }   // must pass the funnel hole
 +bool   isPaused()                  { return !gIsRunning; }
 +void   setPaused(bool p)           { gIsRunning = !p; }
-+void   getRunExtent(PxReal& w, PxReal& h, PxReal& halfDepth) { w = kW; h = kH; halfDepth = kDepth; }
++void   getRunExtent(PxReal& w, PxReal& h, PxReal& trackZ) { w = kW; h = kH; trackZ = kTrackZ; }
++
++// ---------------------------------------------------------------- hose sprayer + particle budget
++// Particles live in a ring: the hose writes new ones at gEmitHead, wrapping at the active cap, so
++// once the cap is reached the oldest water (down in the basin) is recycled back to the nozzle.
++static const PxVec3 kHoseTip(0.42f * T, 5.75f * T, kTrackZ);           // above the funnel
++static const PxVec3 kHoseDir = PxVec3(0.25f, -1.0f, 0.0f).getNormalized();
++static const PxReal kHoseSpeed = 1.8f, kHoseRadius = 0.022f;
++static const PxU32  kEmitPerFrame = 32;                 // ~1900 particles / s at 60 Hz at full flow
++static const PxU32  kEmitMax = 96;                      // array size; flow is clamped so we never exceed it
++static PxReal gHoseFlow = 0.2f;                         // 0 .. 1 (the UI shows it as a percentage), scales both rate and speed
++static bool  gHoseOn = false;
++static PxU32 gMaxActive = 8000, gEmitHead = 0, gActive = 0;
++
++static float frand() { return float(rand()) / float(RAND_MAX); }
++
++static void syncActive()
++{
++	gParticleBuffer->setNbActiveParticles(gActive);
++}
++
++void setMaxActiveParticles(PxU32 cap)
++{
++	gMaxActive = PxClamp(cap, 100u, gParticleCapacity);
++	if (gActive > gMaxActive) gActive = gMaxActive;
++	if (gEmitHead >= gMaxActive) gEmitHead = 0;
++	if (gParticleBuffer) syncActive();
++}
++PxU32 getMaxActiveParticles()   { return gMaxActive; }
++PxU32 getActiveParticles()      { return gActive; }
++PxU32 getParticleCapacity()     { return gParticleCapacity; }
++void  setHoseOn(bool on)        { gHoseOn = on; }
++void  setHoseFlow(PxReal f)     { gHoseFlow = PxClamp(f, 0.05f, 1.0f); }   // never 0: an "on" hose always sprays
++PxReal getHoseFlow()            { return gHoseFlow; }
++PxReal getHoseSpeed()           { return kHoseSpeed * gHoseFlow; }
++PxU32  getHoseRate()            { return PxU32(kEmitPerFrame * gHoseFlow + 0.5f) * 60u; }
++bool  isHoseOn()                { return gHoseOn; }
++void  getHose(PxVec3& tip, PxVec3& dir, PxReal& radius) { tip = kHoseTip; dir = kHoseDir; radius = kHoseRadius; }
++
++void clearWater()
++{
++	gActive = 0; gEmitHead = 0;
++	if (gParticleBuffer) syncActive();
++}
++
++static void emitFromHose(PxReal dt)
++{
++	if (!gHoseOn || !gParticleBuffer) return;
++	PxCudaContextManager* ccm = gScene->getCudaContextManager();
++	PxCudaContext* ctx = ccm->getCudaContext();
++
++	// spray cross-section basis
++	const PxVec3 a(0.0f, 0.0f, 1.0f);
++	const PxVec3 b = kHoseDir.cross(a).getNormalized();
++
++	const PxU32 n = PxMin(kEmitMax, PxU32(kEmitPerFrame * gHoseFlow + 0.5f));
++	const PxReal speed = kHoseSpeed * gHoseFlow;
++	if (n == 0) return;
++	PxVec4 pos[kEmitMax], vel[kEmitMax];
++	PxU32 idx[kEmitMax];
++	for (PxU32 i = 0; i < n; ++i)
++	{
++		const float r = kHoseRadius * sqrtf(frand()), th = 6.2831853f * frand();
++		const PxVec3 off = a * (r * cosf(th)) + b * (r * sinf(th));
++		const PxVec3 p = kHoseTip + off + kHoseDir * (frand() * speed * dt);
++		const PxVec3 v = kHoseDir * (speed * (0.95f + 0.1f * frand())) + off * 2.0f;
++		pos[i] = PxVec4(p, gParticleInvMass);
++		vel[i] = PxVec4(v, 0.0f);
++		idx[i] = gEmitHead;
++		gEmitHead = (gEmitHead + 1) % gMaxActive;
++		gActive = PxMin(gMaxActive, PxMax(gActive, idx[i] + 1));
++	}
++
++	ccm->acquireContext();
++	PxVec4* dPos = gParticleBuffer->getPositionInvMasses();
++	PxVec4* dVel = gParticleBuffer->getVelocities();
++	// indices are consecutive modulo the cap: at most two contiguous runs
++	PxU32 start = 0;
++	while (start < n)
++	{
++		PxU32 end = start + 1;
++		while (end < n && idx[end] == idx[end - 1] + 1) ++end;
++		const size_t bytes = (end - start) * sizeof(PxVec4);
++		ctx->memcpyHtoD(CUdeviceptr(dPos + idx[start]), pos + start, bytes);
++		ctx->memcpyHtoD(CUdeviceptr(dVel + idx[start]), vel + start, bytes);
++		start = end;
++	}
++	ccm->releaseContext();
++
++	syncActive();
++	gParticleBuffer->raiseFlags(PxParticleBufferFlag::eUPDATE_POSITION);
++	gParticleBuffer->raiseFlags(PxParticleBufferFlag::eUPDATE_VELOCITY);
++}
 +
  // -----------------------------------------------------------------------------------------------------------------
  void initPhysics(bool /*interactive*/)
@@ -147,8 +468,8 @@ index 3c6cd15..8516388 100644
 -		pvdClient->setScenePvdFlag(PxPvdSceneFlag::eTRANSMIT_SCENEQUERIES, true);
 -	}
 -	gMaterial = gPhysics->createMaterial(0.5f, 0.5f, 0.6f);
-+	// Water: a block above the first ramp, spacing 12 mm, ~6000 fluid particles.
-+	initParticles(21, 17, 19, PxVec3(0.05f, 1.18f, -kDepth + 0.015f), 0.012f, 1000.0f, 20000);
++	// Water: 50k-slot fluid buffer, 12 mm spacing, empty until the hose is switched on.
++	initParticles(50000, 0.012f, 1000.0f, 20000);
 +	gParticleSystem->setMaxVelocity(8.0f);
  
 -	// Setup PBF
@@ -163,7 +484,7 @@ index 3c6cd15..8516388 100644
 -	initObstacles();
 -
 -	// Setup container
-+	// Container: floor, side walls, and two "glass" walls that make the channel thin in z.
++	// Floor (the deck) and the Magna-Tiles run.
  	gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(0.f, 1.f, 0.f, 0.0f), *gMaterial));
 -	gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(-1.f, 0.f, 0.f, 7.5f), *gMaterial));
 -	gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(0.f, 0.f, 1.f, 7.5f), *gMaterial));
@@ -196,16 +517,12 @@ index 3c6cd15..8516388 100644
 -		gScene->addActor(*body);
 -	}
 -	shape->release();
-+	gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(1.f, 0.f, 0.f, 0.0f), *gMaterial));
-+	gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(-1.f, 0.f, 0.f, kW), *gMaterial));
-+	gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(0.f, 0.f, 1.f, kDepth), *gMaterial));
-+	gScene->addActor(*PxCreatePlane(*gPhysics, PxPlane(0.f, 0.f, -1.f, kDepth), *gMaterial));
-+	for (PxU32 i = 0; i < sizeof(kTiles) / sizeof(kTiles[0]); ++i)
-+		addTile(kTiles[i]);
++	buildRun();
 +	dropBall();
-+	printf("Ball run: %u tiles, %u water particles. Keys: B = drop ball, M = place mode, X = clear balls, [ ] = ball radius, P = pause, O = step, C = reset view\n"
++	if (getenv("BALLRUN_HOSE")) gHoseOn = true;        // testing aid: start spraying immediately
++	printf("Ball run: %u pieces, fluid capacity %u. Keys: H = hose on/off, W = clear water, B = drop ball, M = place mode, X = clear balls, [ ] = ball radius, P = pause, O = step, C = reset view\n"
 +		"Mouse: left drag = orbit, right drag = pan, wheel / middle drag = zoom\n",
-+		PxU32(sizeof(kTiles) / sizeof(kTiles[0])), 21u * 17u * 19u);
++		gNumPieces, gParticleCapacity);
  }
  
  // ---------------------------------------------------
@@ -223,11 +540,17 @@ index 3c6cd15..8516388 100644
 -			const PxReal speed = 3.0f;
 -			PxTransform pose = movingWall->getGlobalPose();
 -			if (moveOut)
--			{
++		++gFrame;
++		emitFromHose(dt);
++		if (getenv("BALLRUN_TRACE") && gFrame % 30 == 0)
++			for (size_t i = 0; i < gBalls.size(); ++i)
+ 			{
 -				pose.p.x += dt * speed;
 -				if (pose.p.x > -7.f)
 -					moveOut = false;
--			}
++				const PxVec3 p = gBalls[i]->getGlobalPose().p, v = gBalls[i]->getLinearVelocity();
++				printf("t=%.1f ball%zu pos=(%.3f %.3f %.3f) vel=(%.2f %.2f %.2f) sleeping=%d\n", gFrame / 60.0f, i, p.x, p.y, p.z, v.x, v.y, v.z, int(gBalls[i]->isSleeping()));
+ 			}
 -			else
 -			{
 -				pose.p.x -= dt * speed;
@@ -237,7 +560,6 @@ index 3c6cd15..8516388 100644
 -			movingWall->setKinematicTarget(pose);
 -		}
 -
-+		++gFrame;
  		gScene->simulate(dt);
  		gScene->fetchResults(true);
  		gScene->fetchResultsParticleSystem();
@@ -265,22 +587,30 @@ index 3c6cd15..8516388 100644
  }
  
  void keyPress(unsigned char key, const PxTransform& /*camera*/)
-@@ -356,6 +347,14 @@ void keyPress(unsigned char key, const PxTransform& /*camera*/)
+@@ -356,6 +587,22 @@ void keyPress(unsigned char key, const PxTransform& /*camera*/)
  	{
  	case 'P':	gIsRunning = !gIsRunning;	break;
  	case 'O':	gIsRunning = false; gStep = true;	break;
 +	case 'B':	dropBall(); break;
 +	case 'X':	clearBalls(); break;
++	case 'H':	gHoseOn = !gHoseOn; break;
++	case 'W':	clearWater(); break;
++	case '-':	setHoseFlow(gHoseFlow - 0.1f); break;
++	case '=':	setHoseFlow(gHoseFlow + 0.1f); break;
 +	case '[':	setBallRadius(gBallRadius - 0.005f); break;
 +	case ']':	setBallRadius(gBallRadius + 0.005f); break;
 +#ifdef RENDER_SNIPPET
 +	case 'C':	{ extern void resetCamera(); resetCamera(); } break;
 +	case 'M':	{ extern void togglePlaceMode(); togglePlaceMode(); } break;
++	case 'T':	{ extern void toggleBuildMode(); toggleBuildMode(); } break;
++	case '1': case '2': case '3': case '4': case '5': case '6':
++		{ extern void setTileColour(PxU32 c); setTileColour(PxU32(key - '1')); } break;
++	case 'F':	{ extern void toggleWireframe(); toggleWireframe(); } break;
 +#endif
  	}
  }
  
-@@ -371,6 +370,5 @@ int snippetMain(int, const char*const*)
+@@ -371,6 +618,5 @@ int snippetMain(int, const char*const*)
  		stepPhysics(false);
  	cleanupPhysics(false);
  #endif
@@ -288,19 +618,20 @@ index 3c6cd15..8516388 100644
  	return 0;
  }
 diff --git i/physx/snippets/snippetpbf/SnippetPBFRender.cpp w/physx/snippets/snippetpbf/SnippetPBFRender.cpp
-index abdc7b9..435fba4 100644
+index abdc7b9..000167b 100644
 --- i/physx/snippets/snippetpbf/SnippetPBFRender.cpp
 +++ w/physx/snippets/snippetpbf/SnippetPBFRender.cpp
-@@ -36,6 +36,8 @@
+@@ -36,6 +36,9 @@
  
  #include "../snippetrender/SnippetRender.h"
  #include "../snippetrender/SnippetCamera.h"
 +#include "../snippetrender/SnippetFontRenderer.h"
 +#include <stdio.h>
++#include <stdint.h>
  
  #define CUDA_SUCCESS 0
  #define SHOW_SOLID_SDF_SLICE 0
-@@ -50,6 +52,16 @@ extern PxPBDParticleSystem* getParticleSystem();
+@@ -50,6 +53,37 @@ extern PxPBDParticleSystem* getParticleSystem();
  extern PxParticleAndDiffuseBuffer* getParticleBuffer();
  
  extern int getNumDiffuseParticles();
@@ -313,20 +644,309 @@ index abdc7b9..435fba4 100644
 +extern void   setBallRadius(PxReal r);
 +extern bool   isPaused();
 +extern void   setPaused(bool p);
-+extern void   getRunExtent(PxReal& w, PxReal& h, PxReal& halfDepth);
++extern void   getRunExtent(PxReal& w, PxReal& h, PxReal& trackZ);
++extern void   setMaxActiveParticles(PxU32 cap);
++extern PxU32  getMaxActiveParticles();
++extern PxU32  getActiveParticles();
++extern PxU32  getParticleCapacity();
++extern void   setHoseOn(bool on);
++extern bool   isHoseOn();
++extern void   getHose(PxVec3& tip, PxVec3& dir, PxReal& radius);
++extern void   clearWater();
++extern void   setHoseFlow(PxReal f);
++extern PxRigidActor* createTile(const PxVec3& c, const PxVec3& n, const PxVec3& up, PxU32 colour, bool ring);
++extern bool   isTile(PxRigidActor* a);
++extern PxU32  getPieceColour(PxRigidActor* a);
++extern void   getTileFrame(PxRigidActor* a, PxVec3& c, PxVec3& n, PxVec3& up);
++extern void   moveTile(PxRigidActor* a, const PxVec3& c);
++extern void   removeTile(PxRigidActor* a);
++extern PxReal getTileSize();
++extern PxReal getTileThickness();
++extern PxRigidActor* pickTile(const PxVec3& origin, const PxVec3& dir, PxVec3& hitPos);
++extern PxReal getHoseFlow();
++extern PxReal getHoseSpeed();
++extern PxU32  getHoseRate();
  
  
  namespace
-@@ -59,6 +71,275 @@ Snippets::Camera* sCamera;
+@@ -58,6 +92,1088 @@ Snippets::Camera* sCamera;
+ 
  Snippets::SharedGLBuffer sPosBuffer;
  Snippets::SharedGLBuffer sDiffusePosLifeBuffer;
- 
++std::vector<PxRigidActor*> sChutes;
++
++// ---------------------------------------------------------------- environment (sky + wooden deck)
++// Both textures are generated procedurally at startup so the snippet needs no asset files.
++GLuint sSkyTex = 0, sWoodTex = 0;
++bool   sWireframe = false;
++
++float hash2(int x, int y)
++{
++	unsigned int h = unsigned(x) * 374761393u + unsigned(y) * 668265263u;
++	h = (h ^ (h >> 13)) * 1274126177u;
++	return float(h & 0xffffff) / float(0xffffff);
++}
++
++float vnoise(float x, float y)   // value noise, bilinear, tileable if the caller wraps
++{
++	const int xi = int(floorf(x)), yi = int(floorf(y));
++	const float fx = x - floorf(x), fy = y - floorf(y);
++	const float sx = fx * fx * (3.0f - 2.0f * fx), sy = fy * fy * (3.0f - 2.0f * fy);
++	const float a = hash2(xi, yi), b = hash2(xi + 1, yi), c = hash2(xi, yi + 1), d = hash2(xi + 1, yi + 1);
++	return (a + (b - a) * sx) + ((c - a) + (a - b + d - c) * sx) * sy;
++}
++
++float fbm(float x, float y, int octaves)
++{
++	float v = 0.0f, amp = 0.5f, sum = 0.0f;
++	for (int i = 0; i < octaves; ++i) { v += amp * vnoise(x, y); sum += amp; x *= 2.03f; y *= 1.97f; amp *= 0.5f; }
++	return v / sum;
++}
++
++GLuint makeTexture(int w, int h, const unsigned char* rgb, bool repeat)
++{
++	GLuint id; glGenTextures(1, &id);
++	glBindTexture(GL_TEXTURE_2D, id);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++	gluBuild2DMipmaps(GL_TEXTURE_2D, GL_RGB, w, h, GL_RGB, GL_UNSIGNED_BYTE, rgb);
++	return id;
++}
++
++static unsigned char toByte(float v) { return (unsigned char)(PxClamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); }
++
++// Equirectangular sky: v = 1 is the zenith, v = 0.5 the horizon.  Gradient + sun glow + fbm clouds.
++void buildSkyTexture()
++{
++	const int W = 512, H = 256;
++	std::vector<unsigned char> px(W * H * 3);
++	const PxVec3 sunDir = PxVec3(-1.0f, 1.0f, 0.5f).getNormalized();   // same as the snippet renderer's light
++	for (int j = 0; j < H; ++j)
++	{
++		const float v = (float(j) + 0.5f) / float(H);          // 0 nadir .. 1 zenith
++		const float el = (v - 0.5f) * PxPi;                     // elevation
++		for (int i = 0; i < W; ++i)
++		{
++			const float u = (float(i) + 0.5f) / float(W);
++			const float az = u * 2.0f * PxPi;
++			const PxVec3 d(cosf(el) * sinf(az), sinf(el), cosf(el) * cosf(az));
++			PxVec3 c;
++			if (el >= 0.0f)
++			{
++				const float t = powf(PxClamp(el / (0.5f * PxPi), 0.0f, 1.0f), 0.55f);
++				c = PxVec3(0.78f, 0.86f, 0.95f) * (1.0f - t) + PxVec3(0.20f, 0.42f, 0.80f) * t;
++				// clouds: fbm on a cylindrical projection, thinning toward the zenith and the horizon
++				const float n = fbm(u * 6.0f * 4.0f, v * 8.0f * 4.0f, 5);
++				const float cover = PxClamp((n - 0.52f) * 4.0f, 0.0f, 1.0f) * PxClamp(el * 4.0f, 0.0f, 1.0f) * (1.0f - 0.6f * t);
++				c = c * (1.0f - cover) + PxVec3(0.97f, 0.97f, 0.99f) * cover;
++			}
++			else
++			{
++				const float t = PxClamp(-el / (0.5f * PxPi), 0.0f, 1.0f);
++				c = PxVec3(0.70f, 0.72f, 0.72f) * (1.0f - t) + PxVec3(0.42f, 0.44f, 0.45f) * t;   // haze below the horizon
++			}
++			const float cs = PxClamp(d.dot(sunDir), 0.0f, 1.0f);
++			const float glow = 0.25f * powf(cs, 8.0f) + 0.8f * powf(cs, 200.0f) + 1.5f * powf(cs, 4000.0f);
++			c += PxVec3(1.0f, 0.95f, 0.8f) * glow;
++			unsigned char* o = &px[(j * W + i) * 3];
++			o[0] = toByte(c.x); o[1] = toByte(c.y); o[2] = toByte(c.z);
++		}
++	}
++	sSkyTex = makeTexture(W, H, &px[0], true);
++}
++
++// Wooden deck: 6 planks across the texture (u), grain along v, dark gaps, staggered end seams.
++void buildWoodTexture()
++{
++	const int W = 512, H = 512, planks = 6;
++	std::vector<unsigned char> px(W * H * 3);
++	for (int j = 0; j < H; ++j)
++	{
++		const float v = (float(j) + 0.5f) / float(H);
++		for (int i = 0; i < W; ++i)
++		{
++			const float u = (float(i) + 0.5f) / float(W);
++			const int   p = int(u * planks);
++			const float pu = u * planks - float(p);                 // 0..1 across this plank
++			const float seamOff = hash2(p, 7) ;                     // staggered end seams
++			const float pv = fmodf(v + seamOff, 1.0f);
++			// per-plank tint
++			const float tint = 0.85f + 0.3f * hash2(p, 3);
++			const float warm = 0.9f + 0.2f * hash2(p, 11);
++			// grain: stretched noise along v with fine streaks
++			const float g1 = fbm(pu * 3.0f + p * 17.0f, v * 40.0f + p * 5.0f, 4);
++			const float g2 = vnoise(pu * 60.0f + p * 31.0f, v * 400.0f);
++			const float grain = 0.72f + 0.35f * g1 + 0.08f * g2;
++			PxVec3 c = PxVec3(0.62f * warm, 0.42f, 0.24f / warm) * tint * grain;
++			// gaps between planks and end seams
++			const float edge = PxMin(pu, 1.0f - pu);
++			if (edge < 0.012f) c *= 0.35f; else if (edge < 0.03f) c *= 0.8f;
++			const float seam = PxMin(pv, 1.0f - pv);
++			if (seam < 0.004f) c *= 0.4f;
++			unsigned char* o = &px[(j * W + i) * 3];
++			o[0] = toByte(c.x); o[1] = toByte(c.y); o[2] = toByte(c.z);
++		}
++	}
++	sWoodTex = makeTexture(W, H, &px[0], true);
++}
++
++void drawDeck()
++{
++	const float y = -0.003f;                      // just under the physics floor so projected shadows sit on top
++	const float x0 = -30.0f, x1 = 31.2f, z0 = -30.0f, z1 = 30.0f;
++	const float plankW = 0.14f, plankL = 1.8f;    // 6 planks per texture repeat across u, one plank length per v
++	const float su = 1.0f / (6.0f * plankW), sv = 1.0f / plankL;
++	glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT);
++	glEnable(GL_LIGHTING);
++	glEnable(GL_TEXTURE_2D);
++	glBindTexture(GL_TEXTURE_2D, sWoodTex);
++	glColor3f(1.0f, 1.0f, 1.0f);
++	glNormal3f(0.0f, 1.0f, 0.0f);
++	const int n = 48;
++	glBegin(GL_QUADS);
++	for (int i = 0; i < n; ++i)
++		for (int j = 0; j < n; ++j)
++		{
++			const float xa = x0 + (x1 - x0) * i / n, xb = x0 + (x1 - x0) * (i + 1) / n;
++			const float za = z0 + (z1 - z0) * j / n, zb = z0 + (z1 - z0) * (j + 1) / n;
++			glTexCoord2f(xa * su, za * sv); glVertex3f(xa, y, za);
++			glTexCoord2f(xa * su, zb * sv); glVertex3f(xa, y, zb);
++			glTexCoord2f(xb * su, zb * sv); glVertex3f(xb, y, zb);
++			glTexCoord2f(xb * su, za * sv); glVertex3f(xb, y, za);
++		}
++	glEnd();
++	glDisable(GL_TEXTURE_2D);
++	glPopAttrib();
++}
++
++// Magna-Tile palette for the ramps, a second palette for the balls.
++static const PxVec3 kTileColors[] = { PxVec3(0.90f, 0.20f, 0.20f), PxVec3(0.20f, 0.45f, 0.95f), PxVec3(0.98f, 0.80f, 0.15f),
++                                      PxVec3(0.25f, 0.75f, 0.30f), PxVec3(0.65f, 0.30f, 0.85f), PxVec3(1.00f, 0.55f, 0.15f) };
++// Ball palette from the Magna-Tiles ball run set: bright translucent primaries, no black or white.
++static const PxVec3 kBallColors[] = { PxVec3(0.90f, 0.15f, 0.20f), PxVec3(0.15f, 0.40f, 0.95f), PxVec3(0.98f, 0.82f, 0.10f),
++                                      PxVec3(0.20f, 0.75f, 0.30f), PxVec3(1.00f, 0.50f, 0.10f), PxVec3(0.60f, 0.25f, 0.85f) };
++static const PxU32 kNumBallColors = 6;
++
++// ---------------------------------------------------------------- water sprites (sphere impostors)
++// Each particle is a point sprite; the fragment shader turns it into a lit, glossy sphere with a
++// Fresnel rim and writes true sphere depth so particles, balls and tiles intersect correctly.
++GLuint sSpriteProg = 0;
++GLint  sUniScale = -1, sUniRadius = -1, sUniColor = -1, sUniAlpha = -1, sUniLight = -1, sUniLife = -1;
++
++static const char* kSpriteVS =
++"uniform float pointScale;\n"
++"uniform float pointRadius;\n"
++"uniform int   useLife;\n"
++"varying vec3  posEye;\n"
++"varying float life;\n"
++"void main() {\n"
++"  vec4 eye = gl_ModelViewMatrix * vec4(gl_Vertex.xyz, 1.0);\n"
++"  posEye = eye.xyz;\n"
++"  life = useLife == 1 ? clamp(gl_Vertex.w, 0.0, 1.0) : 1.0;\n"
++"  gl_PointSize = pointRadius * pointScale / max(-eye.z, 0.001);\n"
++"  gl_Position = gl_ProjectionMatrix * eye;\n"
++"}\n";
++
++static const char* kSpriteFS =
++"uniform float pointRadius;\n"
++"uniform vec3  color;\n"
++"uniform float alpha;\n"
++"uniform vec3  lightEye;\n"
++"varying vec3  posEye;\n"
++"varying float life;\n"
++"void main() {\n"
++"  vec3 N;\n"
++"  N.xy = gl_PointCoord * 2.0 - 1.0;\n"
++"  float r2 = dot(N.xy, N.xy);\n"
++"  if (r2 > 1.0) discard;\n"
++"  N.z = sqrt(1.0 - r2);\n"
++"  vec4 p = vec4(posEye + N * pointRadius, 1.0);\n"
++"  vec4 clip = gl_ProjectionMatrix * p;\n"
++"  gl_FragDepth = (clip.z / clip.w) * 0.5 + 0.5;\n"
++"  vec3 L = normalize(lightEye);\n"
++"  float diff = max(dot(N, L), 0.0);\n"
++"  vec3 H = normalize(L + vec3(0.0, 0.0, 1.0));\n"
++"  float spec = pow(max(dot(N, H), 0.0), 80.0);\n"
++"  float fres = pow(1.0 - N.z, 3.0);\n"
++"  vec3 c = color * (0.55 + 0.45 * diff) + vec3(1.0) * spec * 1.0 + vec3(0.85, 0.92, 1.0) * fres * 0.8;\n"
++"  gl_FragColor = vec4(c, alpha * (0.3 + 0.7 * life));\n"
++"}\n";
++
++GLuint compileShader(GLenum type, const char* src)
++{
++	GLuint sh = glCreateShader(type);
++	glShaderSource(sh, 1, &src, NULL);
++	glCompileShader(sh);
++	GLint ok = 0; glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
++	if (!ok) { char log[2048]; glGetShaderInfoLog(sh, sizeof(log), NULL, log); printf("shader error: %s\n", log); }
++	return sh;
++}
++
++void buildSpriteShader()
++{
++	sSpriteProg = glCreateProgram();
++	glAttachShader(sSpriteProg, compileShader(GL_VERTEX_SHADER, kSpriteVS));
++	glAttachShader(sSpriteProg, compileShader(GL_FRAGMENT_SHADER, kSpriteFS));
++	glLinkProgram(sSpriteProg);
++	GLint ok = 0; glGetProgramiv(sSpriteProg, GL_LINK_STATUS, &ok);
++	if (!ok) { char log[2048]; glGetProgramInfoLog(sSpriteProg, sizeof(log), NULL, log); printf("link error: %s\n", log); }
++	sUniScale  = glGetUniformLocation(sSpriteProg, "pointScale");
++	sUniRadius = glGetUniformLocation(sSpriteProg, "pointRadius");
++	sUniColor  = glGetUniformLocation(sSpriteProg, "color");
++	sUniAlpha  = glGetUniformLocation(sSpriteProg, "alpha");
++	sUniLight  = glGetUniformLocation(sSpriteProg, "lightEye");
++	sUniLife   = glGetUniformLocation(sSpriteProg, "useLife");
++}
++
++// Draws `count` PxVec4 points from a VBO as shaded spheres of world radius `radius`.
++void drawSprites(GLuint vbo, PxU32 count, float radius, const PxVec3& color, float alpha, bool useLife)
++{
++	if (count == 0 || sSpriteProg == 0) return;
++	const float H = float(Snippets::getScreenHeight());
++	const float pointScale = H / tanf(PxDegToRad(30.0f));          // 60 degree vertical FOV
++	// light direction in eye space (the snippet renderer's fixed light)
++	float mv[16]; glGetFloatv(GL_MODELVIEW_MATRIX, mv);
++	const PxVec3 Lw = PxVec3(-1.0f, 1.0f, 0.5f).getNormalized();
++	const PxVec3 Le(mv[0] * Lw.x + mv[4] * Lw.y + mv[8] * Lw.z,
++	                mv[1] * Lw.x + mv[5] * Lw.y + mv[9] * Lw.z,
++	                mv[2] * Lw.x + mv[6] * Lw.y + mv[10] * Lw.z);
++
++	glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_POINT_BIT);
++	glDisable(GL_LIGHTING);
++	glDisable(GL_TEXTURE_2D);
++	glEnable(GL_POINT_SPRITE);
++	glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
++	glPointParameteri(GL_POINT_SPRITE_COORD_ORIGIN, GL_LOWER_LEFT);
++	glEnable(GL_BLEND);
++	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++
++	glUseProgram(sSpriteProg);
++	glUniform1f(sUniScale, pointScale);
++	glUniform1f(sUniRadius, radius);
++	glUniform3f(sUniColor, color.x, color.y, color.z);
++	glUniform1f(sUniAlpha, alpha);
++	glUniform3f(sUniLight, Le.x, Le.y, Le.z);
++	glUniform1i(sUniLife, useLife ? 1 : 0);
++
++	glBindBuffer(GL_ARRAY_BUFFER, vbo);
++	glEnableClientState(GL_VERTEX_ARRAY);
++	glVertexPointer(4, GL_FLOAT, sizeof(PxVec4), 0);
++	glDrawArrays(GL_POINTS, 0, count);
++	glDisableClientState(GL_VERTEX_ARRAY);
++	glBindBuffer(GL_ARRAY_BUFFER, 0);
++	glUseProgram(0);
++	glPopAttrib();
++}
++
 +// ---------------------------------------------------------------- orbit camera
 +// Left drag: orbit around the run.  Right drag: pan.  Wheel / middle drag: zoom.  C: reset view.
-+static const PxVec3 kHomeTarget(0.6f, 0.7f, 0.0f);
-+static const float  kHomeDist = 2.4f;
++// Home view: a child standing at the front-right corner looking down on the run (eye ~1.6 m up).
++static const PxVec3 kHomeTarget(-0.02f, 0.40f, 0.08f);  // offset left so the run sits right of the panel
++static const float  kHomeDist = 1.35f, kHomeYaw = 0.45f, kHomePitch = 0.5f;
 +PxVec3 sTarget = kHomeTarget;
-+float  sYaw = 0.0f, sPitch = 0.0f, sDist = kHomeDist;
++float  sYaw = kHomeYaw, sPitch = kHomePitch, sDist = kHomeDist;
 +int    sLastX = 0, sLastY = 0, sButton = -1;
 +
 +void applyOrbit()
@@ -342,62 +962,245 @@ index abdc7b9..435fba4 100644
 +	return PxVec3(-sinf(sYaw) * cp, -sp, -cosf(sYaw) * cp);
 +}
 +
-+// ---------------------------------------------------------------- UI overlay + ball placement
-+// Panel of clickable buttons (top-left).  "Place mode": a ghost ball follows the cursor on the
-+// run's mid-plane (z = 0); a click (not a drag) drops a ball there.  Drags still orbit / pan / zoom.
-+enum ButtonId { BTN_DROP, BTN_PLACE, BTN_RAD_MINUS, BTN_RAD_PLUS, BTN_CLEAR, BTN_PAUSE, BTN_VIEW, BTN_COUNT };
-+struct Button { int x, y, w, h; ButtonId id; };   // pixels, origin top-left
-+static const int kPanelX = 12, kPanelY = 12, kPanelW = 260, kBtnH = 30, kGap = 6;
-+Button sButtons[BTN_COUNT];
-+int    sHoverBtn = -1;
++void drawSky()
++{
++	const PxVec3 eye = sTarget - orbitDir() * sDist;
++	glPushAttrib(GL_ENABLE_BIT | GL_DEPTH_BUFFER_BIT | GL_CURRENT_BIT);
++	glDisable(GL_LIGHTING);
++	glDisable(GL_CULL_FACE);
++	glDepthMask(GL_FALSE);
++	glEnable(GL_TEXTURE_2D);
++	glBindTexture(GL_TEXTURE_2D, sSkyTex);
++	glColor3f(1.0f, 1.0f, 1.0f);
++	glPushMatrix();
++	glTranslatef(eye.x, eye.y, eye.z);
++	glRotatef(-90.0f, 1.0f, 0.0f, 0.0f);          // gluSphere's pole is +z; put it on +y
++	GLUquadric* q = gluNewQuadric();
++	gluQuadricTexture(q, GL_TRUE);
++	gluQuadricOrientation(q, GLU_INSIDE);
++	gluSphere(q, 80.0, 48, 24);
++	gluDeleteQuadric(q);
++	glPopMatrix();
++	glDepthMask(GL_TRUE);
++	glPopAttrib();
++}
++
++// Soft planar shadows: flatten every visible shape onto y = 0 along the light direction and
++// multiply the framebuffer by a dim colour.  Depth writes are off so the flattened geometry
++// never occludes anything; polygon offset lifts it just above the deck.
++void drawShadows(PxRigidActor** actors, PxU32 n)
++{
++	const PxVec3 L = PxVec3(-1.0f, 1.0f, 0.5f).getNormalized();   // towards the light
++	const float dx = -L.x, dy = -L.y, dz = -L.z;                     // light travel direction
++	const float m[16] = { 1, 0, 0, 0,   -dx / dy, 0, -dz / dy, 0,   0, 0, 1, 0,   0, 0, 0, 1 };
++	glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_POLYGON_BIT | GL_CURRENT_BIT);
++	glDisable(GL_LIGHTING);
++	glDisable(GL_TEXTURE_2D);
++	glEnable(GL_BLEND);
++	glBlendFunc(GL_ZERO, GL_SRC_COLOR);
++	glDepthMask(GL_FALSE);
++	glEnable(GL_POLYGON_OFFSET_FILL);
++	glPolygonOffset(-2.0f, -2.0f);
++	glPushMatrix();
++	glMultMatrixf(m);
++	Snippets::renderActors(actors, n, false, PxVec3(0.45f, 0.45f, 0.52f), NULL, false, false);
++	glPopMatrix();
++	glPopAttrib();
++}
++
++void setupFog(bool on)
++{
++	if (!on) { glDisable(GL_FOG); return; }
++	const float fogColor[] = { 0.78f, 0.86f, 0.95f, 1.0f };   // the sky's horizon colour
++	glEnable(GL_FOG);
++	glFogi(GL_FOG_MODE, GL_LINEAR);
++	glFogfv(GL_FOG_COLOR, fogColor);
++	glFogf(GL_FOG_START, 6.0f);
++	glFogf(GL_FOG_END, 45.0f);
++}
++
++// Chute pieces (half-pipes, funnel, bowl) as smoky translucent plastic: drawn after the water with
++// depth writes off so the stream stays visible through the front wall.
++void drawChutes(const std::vector<PxRigidActor*>& chutes)
++{
++	if (chutes.empty()) return;
++	glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_CURRENT_BIT);
++	glEnable(GL_LIGHTING);
++	glDisable(GL_TEXTURE_2D);
++	glEnable(GL_BLEND);
++	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++	glDepthMask(GL_FALSE);
++	glEnable(GL_CULL_FACE);
++	glCullFace(GL_BACK);
++	glColor4f(0.62f, 0.78f, 0.92f, 0.45f);
++	PxShape* shapes[128];
++	for (size_t i = 0; i < chutes.size(); ++i)
++	{
++		const PxU32 n = chutes[i]->getShapes(shapes, 128);
++		for (PxU32 j = 0; j < n; ++j)
++		{
++			if (shapes[j]->getGeometry().getType() != PxGeometryType::eBOX) continue;
++			const PxBoxGeometry& box = static_cast<const PxBoxGeometry&>(shapes[j]->getGeometry());
++			const PxMat44 pose(PxShapeExt::getGlobalPose(*shapes[j], *chutes[i]));
++			glPushMatrix();
++			glMultMatrixf(&pose.column0.x);
++			glScalef(2.0f * box.halfExtents.x, 2.0f * box.halfExtents.y, 2.0f * box.halfExtents.z);
++			glutSolidCube(1.0);
++			glPopMatrix();
++		}
++	}
++	glPopAttrib();
++}
++
++// ---------------------------------------------------------------- UI overlay (CUDA nbody / paramgl style)
++// A column of rows like the nbody sample's ParamListGL: GLUT 9x15 bitmap text in name / value
++// columns, thin outlined yellow bars for sliders, little switches for toggles, hovered row in white,
++// no panel box.  Rows are clickable; sliders drag.
++enum RowKind { ROW_TITLE, ROW_SLIDER, ROW_TOGGLE, ROW_ACTION, ROW_INFO, ROW_HINT, ROW_SWATCH };
++enum RowId { R_TITLE, R_HOSE, R_FLOW, R_MAXP, R_ACTIVE, R_RADIUS, R_DROP, R_PLACE, R_BUILD, R_TILECOL, R_TILESHAPE, R_CLEARB, R_CLEARW, R_PAUSE, R_WIRE, R_VIEW, R_UISIZE, R_QUIT, R_HINT, ROW_COUNT };
++struct Row { RowKind kind; const char* name; };
++static const Row kRows[ROW_COUNT] = {
++	{ ROW_TITLE,  "PhysX 5.3 ball run" },
++	{ ROW_TOGGLE, "Hose (H)"           },
++	{ ROW_SLIDER, "Hose flow (- =)"    },
++	{ ROW_SLIDER, "Max particles"      },
++	{ ROW_INFO,   "Active water"       },
++	{ ROW_SLIDER, "Ball radius ([ ])"  },
++	{ ROW_ACTION, "Drop ball (B)"      },
++	{ ROW_TOGGLE, "Place mode (M)"     },
++	{ ROW_TOGGLE, "Build mode (T)"     },
++	{ ROW_SWATCH, "Tile colour (1-6)"  },
++	{ ROW_TOGGLE, "Tile shape"         },
++	{ ROW_ACTION, "Clear balls (X)"    },
++	{ ROW_ACTION, "Clear water (W)"    },
++	{ ROW_TOGGLE, "Pause (P)"          },
++	{ ROW_TOGGLE, "Wireframe (F)"      },
++	{ ROW_ACTION, "Reset view (C)"     },
++	{ ROW_SLIDER, "UI size"            },
++	{ ROW_ACTION, "Quit (Esc)"         },
++	{ ROW_HINT,   ""                   },
++};
++
++int sUiSize = 0;   // 0 = automatic from window width, else 1..4
++int uiScale()
++{
++	if (sUiSize > 0) return sUiSize;
++	const int w = int(Snippets::getScreenWidth());
++	return w >= 2600 ? 3 : (w >= 1400 ? 2 : 1);
++}
++struct UiGeom { int S, charW, fontH, rowH, x0, y0, nameX, valueX, barX, barW, barH, keyX, width; };
++UiGeom uiGeom()
++{
++	UiGeom g;
++	g.S = uiScale(); g.fontH = 15 * g.S; g.charW = (g.fontH * 10) / 16; g.rowH = 17 * g.S;
++	g.x0 = 8 * g.S; g.y0 = 8 * g.S;
++	g.nameX  = g.x0 + 5 * g.S;
++	g.valueX = g.x0 + 19 * g.charW;
++	g.barX   = g.x0 + 27 * g.charW;
++	g.barW   = 10 * g.charW;
++	g.barH   = 10 * g.S;
++	g.keyX   = 0;
++	g.width  = g.barX + g.barW + g.charW;
++	return g;
++}
++
++int    sHoverRow = -1;
++int    sSliderDrag = -1;        // row being dragged
 +bool   sPlaceMode = false;
++bool   sBuildMode = false;
++PxU32  sTileColour = 0;
++bool   sTileRing = false;
++PxRigidActor* sHoverTile = NULL;
++PxRigidActor* sDragTile = NULL;
++PxVec3 sDragPlaneN(0, 0, 1), sDragOffset(0.0f);
++bool   sTileGhostValid = false;
++PxVec3 sTileGhostPos(0.0f);
 +int    sCursorX = -1, sCursorY = -1;
 +int    sPressX = 0, sPressY = 0;
 +bool   sGhostValid = false;
 +PxVec3 sGhostPos(0.0f);
 +
-+int layoutButtons()   // returns panel height in pixels
++int rowAt(int x, int y)
 +{
-+	int y = kPanelY + 8 + 3 * 18 + 6;   // below three status lines
-+	const int x = kPanelX + 8, w = kPanelW - 16, hw = (w - kGap) / 2;
-+	int n = 0;
-+	sButtons[n++] = Button{ x, y, w, kBtnH, BTN_DROP };           y += kBtnH + kGap;
-+	sButtons[n++] = Button{ x, y, w, kBtnH, BTN_PLACE };          y += kBtnH + kGap;
-+	sButtons[n++] = Button{ x, y, hw, kBtnH, BTN_RAD_MINUS };
-+	sButtons[n++] = Button{ x + hw + kGap, y, hw, kBtnH, BTN_RAD_PLUS };  y += kBtnH + kGap;
-+	sButtons[n++] = Button{ x, y, w, kBtnH, BTN_CLEAR };          y += kBtnH + kGap;
-+	sButtons[n++] = Button{ x, y, hw, kBtnH, BTN_PAUSE };
-+	sButtons[n++] = Button{ x + hw + kGap, y, hw, kBtnH, BTN_VIEW };      y += kBtnH + kGap;
-+	return y + 8 - kPanelY;
++	const UiGeom g = uiGeom();
++	if (x < 0 || x >= g.width || y < g.y0) return -1;
++	const int i = (y - g.y0) / g.rowH;
++	return i < ROW_COUNT ? i : -1;
 +}
 +
-+int hitButton(int x, int y)
++bool inPanel(int x, int y) { return rowAt(x, y) >= 0; }
++
++// slider value <-> 0..1.  Max particles is log scale 100..capacity; the others are linear.
++float sliderT(int row)
 +{
-+	for (int i = 0; i < BTN_COUNT; ++i)
++	switch (row)
 +	{
-+		const Button& b = sButtons[i];
-+		if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) return i;
++	case R_FLOW:   return PxClamp(getHoseFlow(), 0.0f, 1.0f);
++	case R_UISIZE: return float(uiScale() - 1) / 3.0f;
++	case R_RADIUS: return PxClamp((getBallRadius() - 0.012f) / 0.020f, 0.0f, 1.0f);
++	case R_MAXP:
++	{
++		const float lo = logf(100.0f), hi = logf(float(getParticleCapacity()));
++		return PxClamp((logf(float(getMaxActiveParticles())) - lo) / (hi - lo), 0.0f, 1.0f);
 +	}
-+	return -1;
++	default: return 0.0f;
++	}
 +}
 +
-+bool inPanel(int x, int y)
++void sliderSet(int row, float t)
 +{
-+	const int ph = layoutButtons();
-+	return x >= kPanelX && x < kPanelX + kPanelW && y >= kPanelY && y < kPanelY + ph;
-+}
-+
-+void pressButton(ButtonId id)
-+{
-+	switch (id)
++	t = PxClamp(t, 0.0f, 1.0f);
++	switch (row)
 +	{
-+	case BTN_DROP:      dropBall(); break;
-+	case BTN_PLACE:     sPlaceMode = !sPlaceMode; break;
-+	case BTN_RAD_MINUS: setBallRadius(getBallRadius() - 0.005f); break;
-+	case BTN_RAD_PLUS:  setBallRadius(getBallRadius() + 0.005f); break;
-+	case BTN_CLEAR:     clearBalls(); break;
-+	case BTN_PAUSE:     setPaused(!isPaused()); break;
-+	case BTN_VIEW:      sTarget = kHomeTarget; sYaw = 0.0f; sPitch = 0.0f; sDist = kHomeDist; break;
++	case R_FLOW:   setHoseFlow(floorf(t * 20.0f + 0.5f) / 20.0f); break;                          // 5% steps
++	case R_UISIZE: sUiSize = 1 + int(t * 3.0f + 0.5f); break;
++	case R_RADIUS: setBallRadius(floorf((0.012f + t * 0.020f) * 1000.0f + 0.5f) / 1000.0f); break; // 1 mm steps
++	case R_MAXP:
++	{
++		const float lo = logf(100.0f), hi = logf(float(getParticleCapacity()));
++		PxU32 v = PxU32(expf(lo + t * (hi - lo)) + 0.5f);
++		setMaxActiveParticles(PxMax((v / 100) * 100, 100u));
++		break;
++	}
++	default: break;
++	}
++}
++
++void sliderSetFromX(int row, int x)
++{
++	const UiGeom g = uiGeom();
++	sliderSet(row, float(x - g.barX) / float(g.barW));
++}
++
++bool toggleValue(int row)
++{
++	switch (row)
++	{
++	case R_HOSE:  return isHoseOn();
++	case R_PLACE: return sPlaceMode;
++	case R_BUILD: return sBuildMode;
++	case R_TILESHAPE: return sTileRing;
++	case R_PAUSE: return isPaused();
++	case R_WIRE:  return sWireframe;
++	default: return false;
++	}
++}
++
++void pressRow(int row)
++{
++	switch (row)
++	{
++	case R_HOSE:   setHoseOn(!isHoseOn()); break;
++	case R_PLACE:  sPlaceMode = !sPlaceMode; if (sPlaceMode) sBuildMode = false; break;
++	case R_BUILD:  sBuildMode = !sBuildMode; if (sBuildMode) sPlaceMode = false; sDragTile = NULL; break;
++	case R_TILESHAPE: sTileRing = !sTileRing; break;
++	case R_PAUSE:  setPaused(!isPaused()); break;
++	case R_WIRE:   sWireframe = !sWireframe; break;
++	case R_DROP:   dropBall(); break;
++	case R_CLEARB: clearBalls(); break;
++	case R_CLEARW: clearWater(); break;
++	case R_VIEW:   sTarget = kHomeTarget; sYaw = kHomeYaw; sPitch = kHomePitch; sDist = kHomeDist; break;
++	case R_QUIT:   glutLeaveMainLoop(); break;
 +	default: break;
 +	}
 +}
@@ -415,6 +1218,63 @@ index abdc7b9..435fba4 100644
 +	return (f + sdir * (u * t * w / h) + up * (v * t)).getNormalized();
 +}
 +
++bool hitHose(int x, int y)
++{
++	PxVec3 tip, dir; PxReal r; getHose(tip, dir, r);
++	const PxVec3 centre = tip - dir * 0.06f;
++	const float  radius = 0.09f;
++	const PxVec3 eye = sTarget - orbitDir() * sDist;
++	const PxVec3 ray = cursorRay(x, y);
++	const PxVec3 oc = eye - centre;
++	const float b = oc.dot(ray), c = oc.dot(oc) - radius * radius;
++	return b * b - c >= 0.0f && (-b + sqrtf(b * b - c)) > 0.0f;
++}
++
++PxRigidActor* tileUnderCursor(int x, int y, PxVec3& hitPos)
++{
++	const PxVec3 eye = sTarget - orbitDir() * sDist;
++	return pickTile(eye, cursorRay(x, y), hitPos);
++}
++
++// Ghost for a new tile: cursor ray onto the backdrop plane, snapped to the tile grid.
++void updateTileGhost()
++{
++	sTileGhostValid = false;
++	if (!sBuildMode || sCursorX < 0 || inPanel(sCursorX, sCursorY) || sHoverTile || sDragTile) return;
++	const PxReal T = getTileSize(), zc = -0.5f * getTileThickness();
++	const PxVec3 eye = sTarget - orbitDir() * sDist;
++	const PxVec3 ray = cursorRay(sCursorX, sCursorY);
++	if (fabsf(ray.z) < 1e-4f) return;
++	const float t = (zc - eye.z) / ray.z;
++	if (t <= 0.0f) return;
++	PxVec3 p = eye + ray * t;
++	p.x = (floorf(p.x / T) + 0.5f) * T;
++	p.y = PxMax(0.5f * T, (floorf(p.y / T) + 0.5f) * T);
++	p.z = zc;
++	sTileGhostPos = p;
++	sTileGhostValid = true;
++}
++
++// Drag: slide the tile within its own plane (normal preserved), snapped to half a tile.
++void dragTileTo(int x, int y)
++{
++	const PxVec3 eye = sTarget - orbitDir() * sDist;
++	const PxVec3 ray = cursorRay(x, y);
++	const float denom = ray.dot(sDragPlaneN);
++	if (fabsf(denom) < 1e-4f) return;
++	PxVec3 c, n, up; getTileFrame(sDragTile, c, n, up);
++	const float t = (c - eye).dot(sDragPlaneN) / denom;
++	if (t <= 0.0f) return;
++	PxVec3 target = eye + ray * t - sDragOffset;
++	const PxReal g = 0.5f * getTileSize();
++	// snap the in-plane coordinates on the two axes with the largest in-plane extent
++	for (int axis = 0; axis < 3; ++axis)
++		if (fabsf(sDragPlaneN[axis]) < 0.5f) target[axis] = floorf(target[axis] / g + 0.5f) * g;
++	target.y = PxMax(target.y, 0.5f * getTileSize());
++	target -= sDragPlaneN * sDragPlaneN.dot(target - c);       // stay exactly on the tile's own plane
++	moveTile(sDragTile, target);
++}
++
 +void updateGhost()
 +{
 +	sGhostValid = false;
@@ -422,14 +1282,14 @@ index abdc7b9..435fba4 100644
 +	const PxVec3 eye = sTarget - orbitDir() * sDist;
 +	const PxVec3 ray = cursorRay(sCursorX, sCursorY);
 +	if (fabsf(ray.z) < 1e-4f) return;
-+	const float t = -eye.z / ray.z;          // hit the z = 0 mid-plane
++	PxReal w, h, trackZ; getRunExtent(w, h, trackZ);
++	const float t = (trackZ - eye.z) / ray.z;   // hit the track's centre plane
 +	if (t <= 0.0f) return;
-+	PxReal w, h, d; getRunExtent(w, h, d);
 +	const PxReal r = getBallRadius();
 +	PxVec3 p = eye + ray * t;
 +	p.x = PxClamp(p.x, r + 0.005f, w - r - 0.005f);
 +	p.y = PxClamp(p.y, r + 0.005f, h + 0.3f);
-+	p.z = 0.0f;
++	p.z = trackZ;
 +	sGhostPos = p;
 +	sGhostValid = true;
 +}
@@ -446,19 +1306,62 @@ index abdc7b9..435fba4 100644
 +	if (state == GLUT_DOWN)
 +	{
 +		sPressX = x; sPressY = y;
-+		if (button == GLUT_LEFT_BUTTON && inPanel(x, y))
++		const int row = rowAt(x, y);
++		if (button == GLUT_LEFT_BUTTON && row >= 0)
 +		{
-+			const int b = hitButton(x, y);
-+			if (b >= 0) pressButton(sButtons[b].id);
++			const UiGeom g = uiGeom();
++			const RowKind k = kRows[row].kind;
++			if (k == ROW_SLIDER && x >= g.barX - g.charW)
++			{
++				sSliderDrag = row; sliderSetFromX(row, x);
++			}
++			else if (k == ROW_SWATCH)
++			{
++				const int sw = g.barH + 6 * g.S, gap = 4 * g.S;
++				const int i = (x - g.barX) / (sw + gap);
++				if (x >= g.barX && i >= 0 && i < 6) sTileColour = PxU32(i);
++			}
++			else if (k == ROW_TOGGLE || k == ROW_ACTION)
++				pressRow(row);
 +			sButton = -1;
 +			return;
++		}
++		if (sBuildMode && button == GLUT_LEFT_BUTTON)
++		{
++			PxVec3 hp;
++			if (PxRigidActor* tile = tileUnderCursor(x, y, hp))
++			{
++				PxVec3 c, n, up; getTileFrame(tile, c, n, up);
++				sDragTile = tile; sDragPlaneN = n;
++				sDragOffset = (hp - c) - n * n.dot(hp - c);   // in-plane only, so the tile never leaves its plane
++				sButton = -1;
++				return;
++			}
 +		}
 +		sButton = button;
 +	}
 +	else
 +	{
++		sSliderDrag = -1;
++		if (sDragTile) { sDragTile = NULL; sButton = -1; sLastX = x; sLastY = y; return; }
++		const bool bclick = abs(x - sPressX) < 4 && abs(y - sPressY) < 4;
++		if (sBuildMode && bclick && !inPanel(x, y))
++		{
++			PxVec3 hp;
++			PxRigidActor* tile = tileUnderCursor(x, y, hp);
++			if (button == GLUT_RIGHT_BUTTON && tile) { if (sHoverTile == tile) sHoverTile = NULL; removeTile(tile); }
++			else if (button == GLUT_LEFT_BUTTON && !tile)
++			{
++				sHoverTile = NULL; updateTileGhost();
++				if (sTileGhostValid) createTile(sTileGhostPos, PxVec3(0, 0, 1), PxVec3(0, 1, 0), sTileColour, sTileRing);
++			}
++			sButton = -1; sLastX = x; sLastY = y;
++			return;
++		}
 +		const bool click = abs(x - sPressX) < 4 && abs(y - sPressY) < 4;
-+		if (button == GLUT_LEFT_BUTTON && click && sPlaceMode && !inPanel(x, y))
++		if (button == GLUT_LEFT_BUTTON && click && !inPanel(x, y) && hitHose(x, y))
++			setHoseOn(!isHoseOn());
++		else if (button == GLUT_LEFT_BUTTON && click && sPlaceMode && !inPanel(x, y))
 +		{
 +			updateGhost();
 +			if (sGhostValid) spawnBall(sGhostPos, getBallRadius());
@@ -468,15 +1371,27 @@ index abdc7b9..435fba4 100644
 +	sLastX = x; sLastY = y;
 +}
 +
++// Own keyboard handler: the framework's default consumes W/A/S/D for its free-fly camera
++// before the snippet ever sees them, which silently killed the W (clear water) hotkey.
++void ballrunKeyboard(unsigned char key, int, int)
++{
++	if (key == 27) { glutLeaveMainLoop(); return; }
++	keyPress(key, sCamera->getTransform());
++}
++
 +void orbitPassiveMotion(int x, int y)
 +{
 +	sCursorX = x; sCursorY = y;
-+	sHoverBtn = hitButton(x, y);
++	sHoverRow = rowAt(x, y);
++	PxVec3 hp;
++	sHoverTile = (sBuildMode && sHoverRow < 0) ? tileUnderCursor(x, y, hp) : NULL;
 +}
 +
 +void orbitMotion(int x, int y)
 +{
 +	sCursorX = x; sCursorY = y;
++	if (sSliderDrag >= 0) { sliderSetFromX(sSliderDrag, x); return; }
++	if (sDragTile) { dragTileTo(x, y); return; }
 +	const int dx = x - sLastX, dy = y - sLastY;
 +	sLastX = x; sLastY = y;
 +	if (sButton == GLUT_LEFT_BUTTON)
@@ -496,6 +1411,121 @@ index abdc7b9..435fba4 100644
 +	{
 +		sDist = PxClamp(sDist * expf(float(dy) * 0.01f), 0.2f, 20.0f);
 +	}
++}
++
++// ---- low-poly pistol-grip spray nozzle (after a Dramm-style garden sprayer)
++// Local frame at the spray-head face: +x forward along the spray, +y "up" (perpendicular, in the
++// run plane), +z sideways.  Water is emitted from the origin, i.e. the centre of the head.
++static GLUquadric* sQuad = NULL;
++static const float kHoseScale = 0.6f;   // the sprayer model is drawn at 60% so it suits the 150 mm tiles
++
++void cylBetween(const PxVec3& p0, const PxVec3& p1, float r0, float r1, int slices, bool caps)
++{
++	const PxVec3 d = p1 - p0;
++	const float len = d.magnitude();
++	if (len < 1e-6f) return;
++	const PxVec3 z(0, 0, 1);
++	PxVec3 axis = z.cross(d / len);
++	const float ang = acosf(PxClamp(z.dot(d / len), -1.0f, 1.0f)) * 180.0f / PxPi;
++	if (axis.magnitudeSquared() < 1e-8f) axis = PxVec3(0, 1, 0);
++	glPushMatrix();
++	glTranslatef(p0.x, p0.y, p0.z);
++	glRotatef(ang, axis.x, axis.y, axis.z);
++	gluCylinder(sQuad, r0, r1, len, slices, 1);
++	if (caps)
++	{
++		gluQuadricOrientation(sQuad, GLU_INSIDE);  gluDisk(sQuad, 0.0, r0, slices, 1);
++		gluQuadricOrientation(sQuad, GLU_OUTSIDE); glTranslatef(0, 0, len); gluDisk(sQuad, 0.0, r1, slices, 1);
++	}
++	glPopMatrix();
++}
++
++void sphereAt(const PxVec3& p, float r, int slices)
++{
++	glPushMatrix(); glTranslatef(p.x, p.y, p.z); gluSphere(sQuad, r, slices, slices / 2 + 2); glPopMatrix();
++}
++
++void drawHose()
++{
++	if (!sQuad) { sQuad = gluNewQuadric(); gluQuadricNormals(sQuad, GLU_SMOOTH); }
++	PxVec3 tip, dir; PxReal r; getHose(tip, dir, r);
++	const bool on = isHoseOn();
++	const float t = float(glutGet(GLUT_ELAPSED_TIME)) * 0.001f;
++	const bool invite = !on && getActiveParticles() == 0;
++	const float pulse = invite ? 0.75f + 0.25f * sinf(t * 4.0f) : 1.0f;
++
++	// local frame -> world
++	const PxVec3 X = dir.getNormalized(), Z(0, 0, 1), Y = Z.cross(X);
++	const float m[16] = { X.x, X.y, X.z, 0,  Y.x, Y.y, Y.z, 0,  Z.x, Z.y, Z.z, 0,  tip.x, tip.y, tip.z, 1 };
++
++	const PxVec3 orange(1.0f * pulse, 0.42f * pulse, 0.05f * pulse), black(0.10f, 0.10f, 0.11f);
++	const PxVec3 rubber(0.14f, 0.14f, 0.15f), brass(0.80f, 0.65f, 0.30f), steel(0.75f, 0.76f, 0.78f);
++
++	glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT);
++	glEnable(GL_LIGHTING);
++	glDisable(GL_CULL_FACE);
++	glDisable(GL_TEXTURE_2D);
++	glPushMatrix();
++	glMultMatrixf(m);
++	glScalef(kHoseScale, kHoseScale, kHoseScale);
++
++	// spray head: wide black dial with a face of pattern holes, orange band behind it
++	glColor3fv(&black.x);
++	cylBetween(PxVec3(-0.034f, 0, 0), PxVec3(0, 0, 0), 0.034f, 0.034f, 20, true);
++	glColor3fv(&orange.x);
++	cylBetween(PxVec3(-0.050f, 0, 0), PxVec3(-0.034f, 0, 0), 0.030f, 0.032f, 20, true);
++	// pattern holes ring + centre jet
++	glColor3f(0.05f, 0.05f, 0.05f);
++	for (int i = 0; i < 8; ++i)
++	{
++		const float a = float(i) * (2.0f * PxPi / 8.0f);
++		sphereAt(PxVec3(0.0f, 0.021f * cosf(a), 0.021f * sinf(a)), 0.0045f, 8);
++	}
++	if (on) glColor3f(0.3f, 0.9f, 1.0f); else glColor3fv(&steel.x);
++	sphereAt(PxVec3(0.001f, 0, 0), 0.006f, 10);
++
++	// barrel: orange, tapering toward the head, rounded rear
++	glColor3fv(&orange.x);
++	cylBetween(PxVec3(-0.165f, 0, 0), PxVec3(-0.050f, 0, 0), 0.019f, 0.024f, 16, true);
++	sphereAt(PxVec3(-0.165f, 0, 0), 0.019f, 12);
++	// brass fitting on top of the rear
++	glColor3fv(&brass.x);
++	cylBetween(PxVec3(-0.150f, 0.016f, 0), PxVec3(-0.150f, 0.030f, 0), 0.006f, 0.006f, 10, true);
++
++	// grip: ribbed black rubber hanging down and slightly back
++	const PxVec3 g = PxVec3(-0.26f, -0.97f, 0).getNormalized();
++	const PxVec3 gripTop(-0.115f, -0.012f, 0), gripBot = gripTop + g * 0.115f;
++	glColor3fv(&rubber.x);
++	cylBetween(gripTop, gripBot, 0.017f, 0.019f, 14, true);
++	for (int i = 0; i < 6; ++i)                                   // ribs
++	{
++		const PxVec3 c = gripTop + g * (0.020f + 0.015f * i);
++		cylBetween(c, c + g * 0.005f, 0.0205f, 0.0205f, 14, false);
++	}
++	glColor3f(1.0f, 0.45f, 0.05f);                                // orange dots on the front face of the grip
++	for (int i = 0; i < 4; ++i)
++	{
++		const PxVec3 c = gripTop + g * (0.035f + 0.02f * i) + PxVec3(0.017f, 0.004f, 0);
++		sphereAt(c, 0.0045f, 8);
++	}
++	// hose connector + hose trailing away
++	glColor3fv(&brass.x);
++	cylBetween(gripBot, gripBot + g * 0.022f, 0.015f, 0.013f, 12, true);
++	glColor3f(0.12f, 0.32f, 0.18f);
++	cylBetween(gripBot + g * 0.022f, gripBot + g * 0.45f, 0.011f, 0.011f, 12, true);
++
++	// trigger lever behind the grip: pivot near the barrel rear, swings in when spraying
++	const float pull = on ? 0.5f : 0.0f;
++	const PxVec3 pivot(-0.168f, -0.024f, 0);
++	const PxVec3 lever = PxVec3(-0.42f + 0.14f * pull, -0.91f, 0).getNormalized();   // hangs behind the grip
++	glColor3fv(&black.x);
++	cylBetween(pivot, pivot + lever * 0.105f, 0.007f, 0.006f, 10, true);
++	cylBetween(pivot + lever * 0.105f, pivot + lever * 0.105f + PxVec3(0.02f, -0.008f, 0), 0.006f, 0.005f, 8, true);
++	glColor3fv(&steel.x);
++	sphereAt(pivot, 0.0065f, 10);
++
++	glPopMatrix();
++	glPopAttrib();
 +}
 +
 +void drawGhostBall()
@@ -518,91 +1548,245 @@ index abdc7b9..435fba4 100644
 +	glPopAttrib();
 +}
 +
-+void rect(int x, int y, int w, int h, float r, float g, float b, float a)   // pixel coords, origin top-left
++void drawTileEditor()
 +{
-+	const float H = float(Snippets::getScreenHeight());
-+	glColor4f(r, g, b, a);
-+	glBegin(GL_QUADS);
-+	glVertex2f(float(x), H - float(y));
-+	glVertex2f(float(x + w), H - float(y));
-+	glVertex2f(float(x + w), H - float(y + h));
-+	glVertex2f(float(x), H - float(y + h));
++	if (!sBuildMode) return;
++	const PxReal T = getTileSize(), th = getTileThickness();
++	glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT | GL_LINE_BIT | GL_DEPTH_BUFFER_BIT);
++	glDisable(GL_TEXTURE_2D);
++	glDisable(GL_CULL_FACE);
++	// hovered / dragged tile: white outline
++	if (PxRigidActor* t = sDragTile ? sDragTile : sHoverTile)
++	{
++		const PxMat44 pose(t->getGlobalPose());
++		glDisable(GL_LIGHTING);
++		glLineWidth(2.0f);
++		glColor3f(1.0f, 1.0f, 1.0f);
++		glPushMatrix();
++		glMultMatrixf(&pose.column0.x);
++		glScalef(T * 1.03f, T * 1.03f, th * 2.0f);
++		glutWireCube(1.0);
++		glPopMatrix();
++	}
++	// ghost of the tile about to be created
++	updateTileGhost();
++	if (sTileGhostValid)
++	{
++		const PxVec3 c = kTileColors[sTileColour % 6];
++		glEnable(GL_LIGHTING);
++		glEnable(GL_BLEND);
++		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++		glDepthMask(GL_FALSE);
++		glColor4f(c.x, c.y, c.z, 0.5f);
++		glPushMatrix();
++		glTranslatef(sTileGhostPos.x, sTileGhostPos.y, sTileGhostPos.z);
++		glScalef(T, T, th);
++		glutSolidCube(1.0);
++		glPopMatrix();
++		glDepthMask(GL_TRUE);
++	}
++	glPopAttrib();
++}
++
++// Window-pixel coordinates with y down, like paramgl's beginWinCoords().
++void beginWinCoords()
++{
++	const int W = int(Snippets::getScreenWidth()), H = int(Snippets::getScreenHeight());
++	glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
++	glOrtho(0, W, 0, H, -1, 1);
++	glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
++	glTranslatef(0.0f, float(H - 1), 0.0f);
++	glScalef(1.0f, -1.0f, 1.0f);
++}
++
++void endWinCoords()
++{
++	glMatrixMode(GL_PROJECTION); glPopMatrix();
++	glMatrixMode(GL_MODELVIEW); glPopMatrix();
++}
++
++// Monospace text at window pixel (x, yTop), scaled by the UI size, with a dark drop shadow.
++// Uses the snippet texture font (forced monospace) because GLUT bitmap glyphs cannot be scaled.
++void bmText(int x, int yTop, const char* str, float r, float g, float b)
++{
++	const UiGeom geo = uiGeom();
++	const float W = float(Snippets::getScreenWidth()), H = float(Snippets::getScreenHeight());
++	const float size = float(geo.fontH) / H;
++	const float ny = (H - float(yTop + geo.fontH)) / H;
++	const int mono = 10;   // ~0.6 em advance, like a 9x15 terminal font
++	GLFontRenderer::setColor(0.0f, 0.0f, 0.0f, 1.0f);
++	GLFontRenderer::print_((float(x) + geo.S) / W, ny - geo.S / H, size, str, true, mono);
++	GLFontRenderer::setColor(r, g, b, 1.0f);
++	GLFontRenderer::print_(float(x) / W, ny, size, str, true, mono);
++}
++
++// The font renderer re-enables lighting / depth / cull on exit, so every bar resets state first.
++void barState()
++{
++	glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
++	glDisable(GL_TEXTURE_2D); glDisable(GL_BLEND);
++}
++
++void barOutline(int x, int y, int w, int h)
++{
++	barState();
++	glColor3f(0.25f, 0.25f, 0.25f);
++	glBegin(GL_LINE_LOOP);
++	glVertex2f(float(x), float(y)); glVertex2f(float(x + w), float(y));
++	glVertex2f(float(x + w), float(y + h)); glVertex2f(float(x), float(y + h));
 +	glEnd();
 +}
 +
-+void text(int x, int yTop, int px, const char* str, float r = 1.0f, float g = 1.0f, float b = 1.0f)
++void barFill(int x, int y, int w, int h, bool hot)
 +{
-+	const float W = float(Snippets::getScreenWidth()), H = float(Snippets::getScreenHeight());
-+	GLFontRenderer::setColor(r, g, b, 1.0f);
-+	GLFontRenderer::print(float(x) / W, (H - float(yTop + px)) / H, float(px) / H, str);
++	if (w <= 0) return;
++	barState();
++	if (hot) glColor3f(1.0f, 1.0f, 0.2f); else glColor3f(0.8f, 0.8f, 0.0f);
++	glRectf(float(x), float(y + 1), float(x + w), float(y + h));
 +}
 +
 +void drawOverlay()
 +{
-+	const int W = int(Snippets::getScreenWidth()), H = int(Snippets::getScreenHeight());
-+	const int panelH = layoutButtons();
++	const UiGeom g = uiGeom();
++	char value[64], title[96];
 +
-+	glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT);
++	glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT | GL_LINE_BIT | GL_PIXEL_MODE_BIT);
 +	glDisable(GL_DEPTH_TEST);
 +	glDisable(GL_LIGHTING);
 +	glDisable(GL_TEXTURE_2D);
 +	glDisable(GL_CULL_FACE);
-+	glEnable(GL_BLEND);
-+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-+	glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
-+	glOrtho(0, W, 0, H, -1, 1);
-+	glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
++	glDisable(GL_BLEND);
++	glDisable(GL_FOG);
++	glLineWidth(float(g.S));
++	beginWinCoords();
 +
-+	rect(kPanelX, kPanelY, kPanelW, panelH, 0.05f, 0.05f, 0.08f, 0.72f);
-+
-+	char label[64];
-+	for (int i = 0; i < BTN_COUNT; ++i)
++	// translucent backdrop behind the whole list
 +	{
-+		const Button& b = sButtons[i];
-+		const bool hot = (i == sHoverBtn);
-+		const bool on = (b.id == BTN_PLACE && sPlaceMode) || (b.id == BTN_PAUSE && isPaused());
-+		if (on)       rect(b.x, b.y, b.w, b.h, 0.15f, 0.55f, 0.30f, hot ? 1.0f : 0.9f);
-+		else if (hot) rect(b.x, b.y, b.w, b.h, 0.35f, 0.45f, 0.70f, 1.0f);
-+		else          rect(b.x, b.y, b.w, b.h, 0.22f, 0.26f, 0.40f, 0.95f);
-+		switch (b.id)
-+		{
-+		case BTN_DROP:      strcpy(label, "Drop ball at spout  (B)"); break;
-+		case BTN_PLACE:     strcpy(label, sPlaceMode ? "Place mode: ON  (M)" : "Place mode: OFF  (M)"); break;
-+		case BTN_RAD_MINUS: strcpy(label, "Smaller  ["); break;
-+		case BTN_RAD_PLUS:  strcpy(label, "Bigger  ]"); break;
-+		case BTN_CLEAR:     strcpy(label, "Clear balls  (X)"); break;
-+		case BTN_PAUSE:     strcpy(label, isPaused() ? "Resume  (P)" : "Pause  (P)"); break;
-+		case BTN_VIEW:      strcpy(label, "Reset view  (C)"); break;
-+		default: label[0] = 0;
-+		}
-+		text(b.x + 8, b.y + 7, 15, label);
++		const int pad = 6 * g.S;
++		const int hintW = 56 * g.charW;                        // longest hint line
++		const int w = PxMax(g.width, g.nameX + hintW) + pad;
++		const int h = g.y0 + ROW_COUNT * g.rowH + pad;
++		glEnable(GL_BLEND);
++		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++		glColor4f(0.0f, 0.0f, 0.0f, 0.45f);
++		glRectf(float(g.x0 - pad), float(g.y0 - pad), float(w), float(h));
++		glDisable(GL_BLEND);
 +	}
 +
-+	text(kPanelX + 8, kPanelY + 6, 15, "BALL RUN", 0.85f, 0.9f, 1.0f);
-+	snprintf(label, sizeof(label), "Balls %u / %u    radius %.0f mm", getNumBalls(), getMaxBalls(), getBallRadius() * 1000.0f);
-+	text(kPanelX + 8, kPanelY + 6 + 18, 14, label, 0.8f, 0.8f, 0.85f);
-+	text(kPanelX + 8, kPanelY + 6 + 36, 13, sPlaceMode ? "Click in the run to place a ball" : "Drag: orbit   R-drag: pan   Wheel: zoom", 0.7f, 0.9f, 0.7f);
++	for (int i = 0; i < ROW_COUNT; ++i)
++	{
++		const Row& row = kRows[i];
++		const int y = g.y0 + i * g.rowH;
++		const bool hot = (i == sHoverRow) || (i == sSliderDrag);
++		float r = hot ? 1.0f : 0.75f, gg = r, b = r;      // paramgl: selected white, unselected grey
++		value[0] = 0;
 +
-+	glMatrixMode(GL_PROJECTION); glPopMatrix();
-+	glMatrixMode(GL_MODELVIEW); glPopMatrix();
++		switch (row.kind)
++		{
++		case ROW_TITLE:
++			snprintf(title, sizeof(title), "%s   balls %u/%u", row.name, getNumBalls(), getMaxBalls());
++			bmText(g.nameX, y, title, 0.46f, 0.73f, 0.0f);   // nbody's green
++			continue;
++		case ROW_HINT:
++		{
++			const char* hint = sBuildMode ? "click: add tile   drag a tile: move   right-click: remove"
++			                 : sPlaceMode ? "click in the run to place a ball"
++			                 : (!isHoseOn() && getActiveParticles() == 0) ? "click the hose nozzle to start the water"
++			                 : "drag: orbit   right-drag: pan   wheel: zoom";
++			bmText(g.nameX, y + 4 * g.S, hint, 0.46f, 0.73f, 0.0f);
++			continue;
++		}
++		case ROW_SLIDER:
++			if (i == R_FLOW)        snprintf(value, sizeof(value), "%.0f%%", getHoseFlow() * 100.0f);
++			else if (i == R_MAXP)   snprintf(value, sizeof(value), "%u", getMaxActiveParticles());
++			else if (i == R_RADIUS) snprintf(value, sizeof(value), "%.0f mm", getBallRadius() * 1000.0f);
++			else if (i == R_UISIZE) snprintf(value, sizeof(value), "%dx", uiScale());
++			break;
++		case ROW_TOGGLE:
++			if (i == R_TILESHAPE) strcpy(value, sTileRing ? "ring" : "square");
++			else strcpy(value, toggleValue(i) ? "on" : "off");
++			break;
++		case ROW_INFO:
++			snprintf(value, sizeof(value), "%u", getActiveParticles());
++			break;
++		default: break;
++		}
++
++		bmText(g.nameX, y, row.name, r, gg, b);
++		if (value[0]) bmText(g.valueX, y, value, r, gg, b);
++
++		const int by = y + (g.rowH - g.barH) / 2;
++		if (row.kind == ROW_SLIDER)
++		{
++			barOutline(g.barX, by, g.barW, g.barH);
++			barFill(g.barX, by, int(sliderT(i) * float(g.barW - 1)), g.barH - 1, hot);
++		}
++		else if (row.kind == ROW_TOGGLE)
++		{
++			const int sw = g.barH * 2;
++			barOutline(g.barX, by, sw, g.barH);
++			if (toggleValue(i)) barFill(g.barX, by, sw, g.barH - 1, hot);
++		}
++		else if (row.kind == ROW_SWATCH)
++		{
++			const int sw = g.barH + 6 * g.S, gap = 4 * g.S, sy = y + (g.rowH - sw) / 2;
++			for (int c = 0; c < 6; ++c)
++			{
++				const int sx = g.barX + c * (sw + gap);
++				barState();
++				const PxVec3& col = kTileColors[c];
++				glColor3f(col.x, col.y, col.z);
++				glRectf(float(sx), float(sy), float(sx + sw), float(sy + sw));
++				if (PxU32(c) == sTileColour)
++				{
++					glColor3f(1.0f, 1.0f, 1.0f);
++					glLineWidth(float(2 * g.S));
++					glBegin(GL_LINE_LOOP);
++					glVertex2f(float(sx - g.S), float(sy - g.S)); glVertex2f(float(sx + sw + g.S), float(sy - g.S));
++					glVertex2f(float(sx + sw + g.S), float(sy + sw + g.S)); glVertex2f(float(sx - g.S), float(sy + sw + g.S));
++					glEnd();
++				}
++			}
++		}
++	}
++
++	endWinCoords();
 +	glPopAttrib();
 +	glEnable(GL_DEPTH_TEST);
 +	glEnable(GL_LIGHTING);
 +}
-+
+ 
  void onBeforeRenderParticles()
  {	
- }
-@@ -96,7 +377,7 @@ void renderParticles()
+@@ -95,22 +1211,15 @@ void renderParticles()
+ 
  	sPosBuffer.unmap();
  	sDiffusePosLifeBuffer.unmap();
- 	PxVec3 color(0.5f, 0.5f, 1);
+-	PxVec3 color(0.5f, 0.5f, 1);
 -	Snippets::DrawPoints(sPosBuffer.vbo, sPosBuffer.size / sizeof(PxVec4), color, 2.f);
-+	Snippets::DrawPoints(sPosBuffer.vbo, sPosBuffer.size / sizeof(PxVec4), color, 4.f);
  
  	PxParticleAndDiffuseBuffer* userBuffer = getParticleBuffer();
+-
++	const PxU32 numActive = userBuffer->getNbActiveParticles();
+ 	const PxU32 numActiveDiffuseParticles = userBuffer->getNbActiveDiffuseParticles();
  
-@@ -139,6 +420,7 @@ void clearupParticleBuffers()
+-	//printf("NumActiveDiffuse = %i\n", numActiveDiffuseParticles);
+-
+-	if (numActiveDiffuseParticles > 0)
+-	{
+-		PxVec3 colorDiffuseParticles(1, 1, 1);
+-		Snippets::DrawPoints(sDiffusePosLifeBuffer.vbo, numActiveDiffuseParticles, colorDiffuseParticles, 2.f);
+-	}
+-	
+-	Snippets::DrawFrame(PxVec3(0, 0, 0));
++	// fluid: glossy blue beads slightly larger than the particle spacing so neighbours overlap
++	drawSprites(sPosBuffer.vbo, numActive, 0.0105f, PxVec3(0.50f, 0.72f, 0.95f), 0.62f, false);
++	// foam / spray: small white droplets that fade with their remaining lifetime (stored in w)
++	drawSprites(sDiffusePosLifeBuffer.vbo, numActiveDiffuseParticles, 0.004f, PxVec3(0.95f, 0.97f, 1.0f), 0.8f, true);
+ }
+ 
+ void allocParticleBuffers()
+@@ -139,11 +1248,16 @@ void clearupParticleBuffers()
  
  void renderCallback()
  {
@@ -610,27 +1794,85 @@ index abdc7b9..435fba4 100644
  	onBeforeRenderParticles();
  
  	stepPhysics(true);
-@@ -156,6 +438,8 @@ void renderCallback()
+ 
+-	Snippets::startRender(sCamera);
++	Snippets::startRender(sCamera, 0.05f, 300.0f);
++	setupFog(false);
++	drawSky();
++	setupFog(true);
++	drawDeck();
+ 
+ 	PxScene* scene;
+ 	PxGetPhysics().getScenes(&scene,1);
+@@ -152,10 +1266,37 @@ void renderCallback()
+ 	{
+ 		std::vector<PxRigidActor*> actors(nbActors);
+ 		scene->getActors(PxActorTypeFlag::eRIGID_DYNAMIC | PxActorTypeFlag::eRIGID_STATIC, reinterpret_cast<PxActor**>(&actors[0]), nbActors);
+-		Snippets::renderActors(&actors[0], static_cast<PxU32>(actors.size()), true);
++		std::vector<PxRigidActor*> visible;
++		for (PxU32 i = 0; i < nbActors; ++i)
++		{
++			PxShape* shape = NULL;
++			if (actors[i]->getNbShapes() == 0 || !actors[i]->getShapes(&shape, 1)) continue;
++			if (shape->getGeometry().getType() != PxGeometryType::ePLANE)     // floor / glass stay invisible
++				visible.push_back(actors[i]);
++		}
++		if (!visible.empty())
++			drawShadows(&visible[0], PxU32(visible.size()));
++		PxU32 nBall = 0;
++		sChutes.clear();
++		for (size_t i = 0; i < visible.size(); ++i)
++		{
++			const PxU32 tag = PxU32(uintptr_t(visible[i]->userData));
++			const PxU32 kind = tag >> 8, colour = tag & 0xff;
++			if (visible[i]->is<PxRigidDynamic>() != NULL)
++				Snippets::renderActors(&visible[i], 1, false, kBallColors[(nBall++) % kNumBallColors], NULL, false, sWireframe);
++			else if (kind == 2)
++				sChutes.push_back(visible[i]);                  // translucent, drawn after the water
++			else
++				Snippets::renderActors(&visible[i], 1, false, kTileColors[colour % 6], NULL, false, sWireframe);
++		}
  	}
  	
++	drawHose();
  	renderParticles();
++	drawChutes(sChutes);
 +	drawGhostBall();
++	drawTileEditor();
 +	drawOverlay();
  
  	Snippets::showFPS();
  
-@@ -174,11 +458,25 @@ void exitCallback(void)
+@@ -174,11 +1315,48 @@ void exitCallback(void)
  }
  }
  
++void toggleWireframe()
++{
++	sWireframe = !sWireframe;
++}
++
++void toggleBuildMode()
++{
++	sBuildMode = !sBuildMode;
++	if (sBuildMode) sPlaceMode = false;
++	sDragTile = NULL;
++}
++
++void setTileColour(PxU32 c)
++{
++	sTileColour = c % 6;
++}
++
 +void togglePlaceMode()
 +{
 +	sPlaceMode = !sPlaceMode;
++	if (sPlaceMode) sBuildMode = false;
 +}
 +
 +void resetCamera()
 +{
-+	sTarget = kHomeTarget; sYaw = 0.0f; sPitch = 0.0f; sDist = kHomeDist;
++	sTarget = kHomeTarget; sYaw = kHomeYaw; sPitch = kHomePitch; sDist = kHomeDist;
 +}
 +
  void renderLoop()
@@ -643,6 +1885,11 @@ index abdc7b9..435fba4 100644
 +	glutMouseFunc(orbitMouse);
 +	glutMotionFunc(orbitMotion);
 +	glutPassiveMotionFunc(orbitPassiveMotion);
++	glutKeyboardFunc(ballrunKeyboard);
++	glutSpecialFunc(NULL);
++	buildSkyTexture();
++	buildWoodTexture();
++	buildSpriteShader();
 +	applyOrbit();
  
  	initPhysics(true);
